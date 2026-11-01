@@ -147,6 +147,33 @@ describe("native status continuation behind outgoing ownership", () => {
         cancellation: { source: "control_plane", reason: "Other owner stopped", expected: true } },
     }).returning();
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    const held = await start();
+    expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
+    await held.stop();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    const closed = await start();
+    expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
+    expect(closed.nextWakeAt()).toBeNull();
+  });
+
+  it("preserves Stop when the native intent predates it but its dispatch receipt is admitted afterward", async () => {
+    const f = await fixture();
+    const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      resultJson: { conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "acknowledged" } },
+    }).returning();
+    const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.outgoing.agentId,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      resultJson: { conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "acknowledged" } },
+    }).returning();
+    const worker = await start();
+    const [saved] = await dispatches(f);
+    expect(saved).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
+    await worker.stop();
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
     await start();
     expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
   });
