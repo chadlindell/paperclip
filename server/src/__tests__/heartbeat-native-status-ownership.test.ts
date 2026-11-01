@@ -192,7 +192,8 @@ describe("native status continuation behind outgoing ownership", () => {
     const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, f.assessmentId));
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     const freshRunId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
-    await db.insert(heartbeatRuns).values({ ...source, id: freshRunId, startedAt: new Date(), finishedAt: new Date() });
+    await db.insert(heartbeatRuns).values({ ...source, id: freshRunId, createdAt: new Date(), updatedAt: new Date(),
+      startedAt: new Date(), finishedAt: new Date() });
     await db.insert(nativeRunResults).values({ ...result, id: resultId, runId: freshRunId,
       serverFingerprint: `fresh:${freshRunId}`, canonicalSha256: `fresh:${freshRunId}` });
     await db.insert(workAssessments).values({ ...assessment, id: assessmentId, runId: freshRunId, resultId,
