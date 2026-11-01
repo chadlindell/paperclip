@@ -286,6 +286,9 @@ it.each(["prior-release", "physical-read"] as const)("does not activate a recove
     void attach.catch(() => undefined);
     await queued.promise;
     expect(inspectStagedRunAttachmentHeader(checkpoint.records.get("header")!)?.phase).toBe("attachment_queued");
+    // This fixture externally fences the old checkpoint writer to model lost
+    // controller authority. Ignoring its detach rejection below is fixture-only;
+    // production takeover still requires successful retirement proof.
     generation++;
     const firstDetach = first.detachControllerForRestart(); void firstDetach.catch(() => undefined);
     queuedHold.release(); await firstDetach.catch(() => undefined); await attach.catch(() => undefined);
