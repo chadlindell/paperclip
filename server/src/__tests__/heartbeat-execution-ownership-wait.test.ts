@@ -13,6 +13,8 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("wakes parked behind an execution ownership hold", () => {
@@ -168,6 +170,60 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(runs).toHaveLength(1);
     expect(runs[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "issue_assigned", interruptedRunId: f.runId });
     expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
+  });
+
+  it.each([false, true])("keeps ownership stage receipts out of the cleanup drain (obsolete=%s)", async obsolete => {
+    const f = await seed();
+    const { heartbeat, parked } = await parkWake(f);
+    if (obsolete) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      await db.update(issues).set({ executionState: { ...issue!.executionState as Record<string, unknown>,
+        currentStageId: randomUUID() } }).where(eq(issues.id, f.issueId));
+    }
+    await releaseLease(f);
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "board",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("unexpected recovery"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected recovery"); },
+      },
+    });
+    expect((await release({ companyId: f.companyId, runId: f.runId, now: new Date() })).outcome.kind).toBe("released");
+    expect(await nextAgentIssueRuns(f)).toHaveLength(0);
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe("deferred_issue_execution");
+    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
+    expect(await nextAgentIssueRuns(f)).toHaveLength(obsolete ? 0 : 1);
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe(obsolete ? "cancelled" : "coalesced");
+  });
+
+  it.each(["resume", "adopt"] as const)("rejects an obsolete executor handback during %s", async path => {
+    const f = await seed();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const state = { ...issue!.executionState as Record<string, unknown>, status: "changes_requested",
+      returnAssignee: { type: "agent", agentId: f.nextAgentId, userId: null } };
+    await db.update(issues).set({ status: "todo", executionState: state }).where(eq(issues.id, f.issueId));
+    const stage = { ...f.wake.payload.executionStage!, wakeRole: "executor", returnAssignee: state.returnAssignee };
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(f.nextAgentId, { ...f.wake,
+      payload: { ...f.wake.payload, executionStage: stage },
+      contextSnapshot: { ...f.wake.contextSnapshot, executionStage: stage } });
+    const [parked] = await nextAgentWakes(f);
+    expect(parked?.status).toBe("deferred_issue_execution");
+    await db.update(issues).set({ executionState: { ...state, currentStageId: randomUUID() } }).where(eq(issues.id, f.issueId));
+    await releaseLease(f);
+    if (path === "adopt") {
+      const fresh = await heartbeat.wakeup(f.nextAgentId, { source: "on_demand", reason: "issue_commented",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId },
+        requestedByActorType: "user", requestedByActorId: "board" });
+      expect(fresh?.contextSnapshot?.executionStage).toBeUndefined();
+    }
+    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
+    expect(await nextAgentIssueRuns(f)).toHaveLength(path === "adopt" ? 1 : 0);
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked!.id)?.status).toBe("cancelled");
   });
 
   it("waits for the outgoing process after its lease is released", async () => {
