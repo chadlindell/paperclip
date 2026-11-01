@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { and, asc, eq, ne, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issues,
+  agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issueThreadInteractions, issues,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -377,6 +377,47 @@ const support = await getEmbeddedPostgresTestSupport();
       expect((await nextAgentWakes(f)).find(wake => wake.id === id))
         .toMatchObject({ status: "coalesced", runId: runs[0]!.id });
     }
+    await heartbeat.resumeQueuedRuns();
+    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+  });
+
+  it("promotes a lone parked comment after ownership releases without another wake", async () => {
+    const f = await seed({ stage: false });
+    const { heartbeat, comment, parked } = await parkComment(f);
+    await releaseLease(f);
+    await heartbeat.resumeQueuedRuns();
+    const runs = await nextAgentIssueRuns(f);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].contextSnapshot).toMatchObject({ issueId: f.issueId, wakeCommentIds: [comment.id] });
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.runId).toBe(runs[0].id);
+    await heartbeat.resumeQueuedRuns();
+    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+  });
+
+  it("promotes a lone parked interaction after ownership releases without another wake", async () => {
+    const f = await seed({ stage: false });
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({ id: interactionId, companyId: f.companyId,
+      issueId: f.issueId, kind: "request_confirmation", status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept", createdByAgentId: f.nextAgentId,
+      resolvedByUserId: "board", resolvedAt: new Date(),
+      payload: { version: 1, prompt: "Approve the plan?", target: {
+        type: "issue_document", issueId: f.issueId, key: "plan", revisionId: randomUUID() } },
+      result: { version: 1, outcome: "accepted" } });
+    const context = { issueId: f.issueId, interactionId, interactionKind: "request_confirmation",
+      interactionStatus: "accepted", mutation: "interaction", continuationPolicy: "wake_assignee_on_accept" };
+    const heartbeat = heartbeatService(db);
+    expect(await heartbeat.wakeup(f.nextAgentId, { source: "automation", reason: "issue_commented",
+      payload: context, contextSnapshot: context, requestedByActorType: "user", requestedByActorId: "board" })).toBeNull();
+    const [parked] = await nextAgentWakes(f);
+    expect(parked).toMatchObject({ status: "deferred_issue_execution", payload: {
+      mutation: "interaction", executionWait: { cause: "execution_owner_active" } } });
+    await releaseLease(f);
+    await heartbeat.resumeQueuedRuns();
+    const runs = await nextAgentIssueRuns(f);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].contextSnapshot).toMatchObject(context);
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked!.id)?.runId).toBe(runs[0].id);
     await heartbeat.resumeQueuedRuns();
     expect(await nextAgentIssueRuns(f)).toHaveLength(1);
   });
