@@ -4665,6 +4665,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #stopAndDrainAuthority(deadline: number): Promise<void> {
     const core = this.#core;
     if (!core) return;
+    core.fenceSemanticToolCallbacks();
     await core.stop();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
