@@ -1311,8 +1311,17 @@ it.each(["after_budget", "within_budget", "interrupted_within_budget", "persiste
         expect(reopened.semanticToolResultsSettled()).toBe(false);
         await reopened.stop();
       }
+      const retiredJournal = mode === "after_budget"
+        ? await readFile(join(stateDirectory, "control-plane", "control-plane-state.json"), "utf8")
+        : null;
       release();
-      if (mode === "persistence_failure") {
+      if (mode === "after_budget") {
+        // The old writer has retired. Preserve its unresolved input for the
+        // successor instead of mutating the journal after ownership release.
+        await new Promise(resolveWait => setTimeout(resolveWait, 50));
+        expect(await readFile(join(stateDirectory, "control-plane", "control-plane-state.json"), "utf8")).toBe(retiredJournal);
+      }
+      if (mode === "persistence_failure" || mode === "after_budget") {
         expect(core.semanticToolResultsSettled()).toBe(false);
         expect(
           core.store.state.commands.filter(
