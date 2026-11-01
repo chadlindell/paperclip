@@ -24,9 +24,11 @@ const support = await getEmbeddedPostgresTestSupport();
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("execution-ownership-wait-");
-    db = createDb(database.connectionString);
+    db = createDb(database.connectionString, { maxConnections: 6, idleTimeoutSeconds: 0, maxLifetimeSeconds: 0 });
+    db.$client.options.onnotice = () => {};
+    await Promise.all(Array.from({ length: 6 }, () => db.execute(sql`select pg_sleep(0.01)`)));
   }, 90_000);
-  afterAll(async () => { await database?.cleanup(); });
+  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
   type Fixture = Awaited<ReturnType<typeof seed>>;
 
