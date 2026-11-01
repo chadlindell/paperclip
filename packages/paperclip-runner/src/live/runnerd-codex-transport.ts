@@ -4686,6 +4686,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#closed) return;
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
     this.#controllerDetachedForRestart = true;
+    this.#core?.fenceSemanticToolCallbacks();
     // Retire the journal writer before releasing waiting semantic handlers.
     // Controller loss leaves their inputs pending for the successor; it must
     // not manufacture cancellation results during old-controller cleanup.
@@ -6356,6 +6357,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (
       !accepted ||
       this.#closed ||
+      this.#controllerDetachedForRestart ||
       !threadId ||
       (!expectedThreadId && !this.#startupComplete) ||
       epoch !== this.#turnStartResponseEpoch ||
