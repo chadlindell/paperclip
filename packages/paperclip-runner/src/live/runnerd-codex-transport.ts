@@ -4322,12 +4322,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           const proof = inspectWarmRunTransition({ controlPlaneState: core.store.state, runnerState: physical,
             expectedNewIdentity: desired, expectedRunnerVersion: artifact.version, expectedRunnerDigest: artifact.digest });
           if (proof && recoveryIdentityMatches(proof.runnerIdentity, desired)) {
-            await previousRelease?.(); previousReleased = true; break;
+            await previousRelease?.(this.#controllerDetachedForRestart ? "detach" : undefined); previousReleased = true; break;
           }
           if (Date.now() >= deadline || await this.#runnerHasExited()) throw new Error("native_runner_warm_transition_activation_pending");
           await new Promise<void>(done => setTimeout(done, 100));
         }
       }
+      this.#assertStartupOpen();
       await registration?.activate?.();
       if (registration?.failure) {
         void registration.failure.catch((error: unknown) => {
@@ -4358,8 +4359,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#eventSourceSeq = 0;
       this.#deferredTurnStartEvents = [];
       this.#durableTurnId = desired.turnId;
-      if (!previousReleased) await previousRelease?.();
+      if (!previousReleased) await previousRelease?.(this.#controllerDetachedForRestart ? "detach" : undefined);
       previousReleased = true;
+      this.#assertStartupOpen();
       this.#controlPlaneRelease = registration?.release ?? null;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
@@ -4368,7 +4370,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // Keep the prior release owned by close until its handoff is confirmed.
       if (!this.#closed) this.#controlPlaneRelease = previousReleased ? null : previousRelease;
       await Promise.resolve()
-        .then(() => registration?.release())
+        .then(() => registration?.release(this.#controllerDetachedForRestart ? "detach" : undefined))
         .catch((error: unknown) => {
           this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
         });
@@ -4378,7 +4380,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#controlPlaneRelease = null;
         if (!previousReleased) {
           await Promise.resolve()
-            .then(() => previousRelease?.())
+            .then(() => previousRelease?.(this.#controllerDetachedForRestart ? "detach" : undefined))
             .catch((error: unknown) => {
               this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
             });
@@ -5374,7 +5376,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#closed && this.#startupDrainTimedOut) {
       const release = this.#controlPlaneRelease;
       this.#controlPlaneRelease = null;
-      await release?.();
+      await Promise.resolve()
+        .then(() => release?.(this.#controllerDetachedForRestart ? "detach" : undefined))
+        .catch((error: unknown) => {
+          this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+          throw error;
+        });
     }
     this.#assertStartupOpen();
     const admissionDeadline = this.#coldAdmissionDeadline();
@@ -6053,7 +6060,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         }
       } catch (error) {
         const releases = await Promise.allSettled([oldTransitionRegistration, newTransitionRegistration]
-          .map(entry => Promise.resolve().then(() => entry?.release())));
+          .map(entry => Promise.resolve().then(() => entry?.release(this.#controllerDetachedForRestart ? "detach" : undefined))));
         for (const result of releases) {
           if (result.status === "rejected") {
             this.#controllerCleanupFailure ??= result.reason instanceof Error ? result.reason : new Error(String(result.reason));
@@ -6097,7 +6104,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#closed && this.#startupDrainTimedOut) {
       const release = this.#controlPlaneRelease;
       this.#controlPlaneRelease = null;
-      await release?.();
+      await Promise.resolve()
+        .then(() => release?.(this.#controllerDetachedForRestart ? "detach" : undefined))
+        .catch((error: unknown) => {
+          this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+          throw error;
+        });
     }
     this.#assertStartupOpen();
     // Route and immutable endpoint admission precedes every launch-material

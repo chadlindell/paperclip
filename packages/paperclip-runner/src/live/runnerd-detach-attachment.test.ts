@@ -137,6 +137,9 @@ it.each([
       expect(detachSettled, "detach must also join that attachment's asynchronous route release").toBe(false);
       releaseHeld.release();
       await expect(attaching).rejects.toThrow(/closed/);
+      expect(releaseReasons.filter(value => value.route === "next")).toEqual([
+        { route: "next", reason: retirement === "detach" ? "detach" : undefined },
+      ]);
       if (releaseFailure !== "none") {
         await expect(detaching).rejects.toThrow(`synthetic ${releaseFailure} route release failed`);
         expect(detached, "failed route cleanup must never authorize a successor").toBe(false);

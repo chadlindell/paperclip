@@ -89,11 +89,10 @@ it.each(["released", "release-failed", "composite-sync-failed"] as const)("prese
     await expect(opening).rejects.toThrow(/closed during provider startup/);
     if (failRelease) await expect(detaching).rejects.toThrow("synthetic source registration release failed");
     else await detaching;
-    expect(releaseRoute).toHaveBeenCalledOnce();
+    expect(releaseRoute).toHaveBeenCalledExactlyOnceWith("detach");
     expect(registration).toHaveBeenCalledTimes(composite ? 2 : 1);
     if (composite) {
       expect(releaseTarget).toHaveBeenCalledExactlyOnceWith("detach");
-      expect(releaseRoute).toHaveBeenCalledExactlyOnceWith("detach");
     }
     expect(launch).not.toHaveBeenCalled();
     const retired = await readFile(seed.store.path, "utf8");

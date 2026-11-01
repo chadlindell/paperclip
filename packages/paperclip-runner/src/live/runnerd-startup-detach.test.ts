@@ -128,9 +128,11 @@ async function boundedOutcome(operation: Promise<void>) {
   } finally { clearTimeout(timer); }
 }
 
-it.each(["stopped", "stop-failed"] as const)("still retires an existing core after startup join timeout (%s)", async mode => {
+it.each(["stopped", "stop-failed", "release-failed"] as const)("still retires an existing core after startup join timeout (%s)", async mode => {
   const gate = deferred();
-  const release = vi.fn(async () => {});
+  const release = vi.fn(async () => {
+    if (mode === "release-failed") throw new Error("fixture late route release failed");
+  });
   const fixture = await registeredFixture(release, gate.promise);
   const stop = vi.spyOn(fixture.core, "stop");
   if (mode === "stop-failed") stop.mockRejectedValueOnce(new Error("fixture stop failed"));
@@ -145,8 +147,9 @@ it.each(["stopped", "stop-failed"] as const)("still retires an existing core aft
     }
     await expect(next).resolves.toMatchObject({ done: true });
     gate.resolve();
-    await expect(fixture.opening).rejects.toThrow("closed during provider startup");
+    await expect(fixture.opening).rejects.toThrow(mode === "release-failed" ? "fixture late route release failed" : "closed during provider startup");
     expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith("detach");
     await expect(fixture.bundle.detachControllerForRestart()).rejects.toThrow("startup drain timed out");
   } finally {
     gate.resolve();
