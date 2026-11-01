@@ -926,6 +926,8 @@ async function consumeTurn(
     let governedResult: PrpStructuredRunResult | null = null;
     let semanticResultProposal: PrpStructuredRunResult | null = null;
     let semanticResultTurnId: string | null = null;
+    let observedTurnStart = false;
+    let latestStartedTurnId: string | null = null;
     let sessionGoalObserved = sessionGoal !== undefined;
     let previousGoal = initialGoal ?? null;
     let goalControlObserved = false;
@@ -1061,6 +1063,10 @@ async function consumeTurn(
       // A new turn revokes the preceding turn's completion authority, just as
       // the provider driver does. Preserve duplicate/replayed starts only when
       // both events prove the same turn; an absent identity cannot prove reuse.
+      if (event.eventType === "turn.started") {
+        observedTurnStart = true;
+        latestStartedTurnId = event.turnId ?? null;
+      }
       if (event.eventType === "turn.started" && semanticResultProposal !== null &&
           (!event.turnId || event.turnId !== semanticResultTurnId)) {
         semanticResultProposal = null;
@@ -1070,6 +1076,12 @@ async function consumeTurn(
           resultSource = null;
         }
       }
+      // A delayed result from a preceding turn cannot reacquire authority after
+      // the new turn has started. Keep its durable event for diagnosis, but do
+      // not replace either a current report or the missing-report outcome.
+      // Before observing a start, replayed reports retain their existing path.
+      if (event.eventType === "run.result.proposed" && observedTurnStart &&
+          (!latestStartedTurnId || event.turnId !== latestStartedTurnId)) continue;
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
