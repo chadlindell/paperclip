@@ -15,7 +15,7 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { deferredExecutionOwnershipWaitPredicate } from "../../../services/heartbeat/ownership-wait-predicate.js";
-import { deferredNativeWakeDisposition } from "../../../services/native-runtime/native-continuation-delivery.js";
+import { hasDeferredNativeWakeStop } from "../../../services/native-runtime/native-continuation-delivery.js";
 import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import type { Db } from "@paperclipai/db";
@@ -256,17 +256,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
         const candidate = toDeferredWakeCandidate(row);
-        const nativeDisposition = await deferredNativeWakeDisposition(tx, row, issueId);
-        if (nativeDisposition === "preserve") {
+        if (await hasDeferredNativeWakeStop(tx, row, issueId)) {
           excludedWakeIds = [...(excludedWakeIds ?? []), row.id];
-          continue;
-        }
-        if (nativeDisposition === "cancel") {
-          await notifyChatRunMilestones(tx, { companyId, issueId });
-          await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date(),
-            error: "Native status continuation no longer applies to the current task owner or review" })
-            .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, row.id),
-              eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
           continue;
         }
         try {

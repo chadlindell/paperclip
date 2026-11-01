@@ -1,34 +1,18 @@
-import { agentWakeupRequests, heartbeatRuns, issues, statusDecisions, statusDecisionEffects, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, statusDecisions, statusDecisionEffects, type Db } from "@paperclipai/db";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { boundRunIssueIdSql } from "../run-task-binding.js";
-import { readChatControlNativeParent } from "../chat-control-recovery-stop.js";
-import { getNativeReviewAssignment } from "./native-review-participant.js";
-import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../acknowledged-native-stop.js";
 import { readRunCancellation } from "../run-cancellation.js";
 
-export async function deferredNativeWakeDisposition(db: Db,
-  wake: Pick<typeof agentWakeupRequests.$inferSelect, "companyId" | "agentId" | "requestedByActorType" | "requestedByActorId" | "requestedAt" | "payload" | "reason">,
+export async function hasDeferredNativeWakeStop(db: Db,
+  wake: Pick<typeof agentWakeupRequests.$inferSelect, "companyId" | "agentId" | "requestedByActorType" | "requestedByActorId" | "requestedAt" | "payload">,
   issueId: string,
-): Promise<"allow" | "preserve" | "cancel" | null> {
+): Promise<boolean> {
   const context = wake.payload?._paperclipWakeContext as Record<string, unknown> | undefined;
   const intentId = context?.nativeStatusWakeIntentId;
-  if (typeof intentId !== "string" || !intentId.trim()) return null;
-  if (wake.requestedByActorType !== "system" || wake.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return "cancel";
-  const parent = await readChatControlNativeParent(db, { companyId: wake.companyId, issueId, agentId: wake.agentId }, wake.requestedByActorId);
-  if (parent.kind === "unresolved") return "preserve";
-  const [issue] = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId }).from(issues)
-    .where(and(eq(issues.companyId, wake.companyId), eq(issues.id, issueId))).limit(1);
-  const reason = typeof context?.wakeReason === "string" ? context.wakeReason : wake.reason;
-  const nativeReview = reason === "native_completion_review" ? await getNativeReviewAssignment(db, {
-    companyId: wake.companyId, issueId, agentId: wake.agentId, contextSnapshot: context,
-  }) : null;
-  const onboardingReport = issue?.status === "done" && await isCompletedOnboardingHandoffWake(db, {
-    companyId: wake.companyId, issueId, agentId: wake.agentId, reason, contextSnapshot: context,
-  });
-  if (!issue || (["done", "cancelled"].includes(issue.status) && !onboardingReport) ||
-      (issue.assigneeAgentId !== wake.agentId && !nativeReview) || (reason === "native_completion_review" && !nativeReview)) return "cancel";
+  if (typeof intentId !== "string" || !intentId.trim() || wake.requestedByActorType !== "system" ||
+      wake.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return false;
   const stopped = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId), eq(heartbeatRuns.status, "cancelled"),
     eq(boundRunIssueIdSql(), issueId), sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) >= ${wake.requestedAt}`,
@@ -43,7 +27,7 @@ export async function deferredNativeWakeDisposition(db: Db,
       run.processStartedAt === null && run.processPid === null && run.processGroupId === null && cancellation?.source === "operator" && cancellation.expected;
     return queuedStop || (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged" ||
       isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run);
-  }) ? "preserve" : "allow";
+  });
 }
 
 /** Recover conversation provenance from a committed continuation, never from

@@ -204,4 +204,18 @@ describe("native status continuation behind outgoing ownership", () => {
     await delay(20);
     expect(reads).not.toHaveBeenCalled();
   });
+
+  it.each(["done", "cancelled"])("retires the native continuation when the task becomes %s before lease release", async status => {
+    const f = await fixture();
+    const worker = await start();
+    const [saved] = await dispatches(f);
+    await worker.stop();
+    await db.update(issues).set({ status, statusVersion: sql`${issues.statusVersion} + 1` }).where(eq(issues.id, f.issueId));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    const restarted = await start();
+    expect(await successors(f)).toHaveLength(0);
+    expect((await dispatches(f))[0]).toMatchObject({ id: saved.id, status: "cancelled", runId: null });
+    expect(restarted.nextWakeAt()).toBeNull();
+  });
 });
