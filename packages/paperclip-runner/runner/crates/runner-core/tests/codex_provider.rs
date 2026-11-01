@@ -6210,6 +6210,7 @@ fn codex_completion_requires_an_accepted_bound_result() {
                 if event.event_type == "semantic_tool.input" {
                     inputs += 1;
                     assert!(accepted_report);
+                    assert_eq!(event.payload["semantic_tool"]["input"], input);
                     executor.execute(&command("accept", 4, "semantic_tool.result", json!({"callId": "terminal-result-call",
                         "operationId": "paperclip_finish", "isError": false, "result": {"accepted": true}}))).unwrap();
                 }
@@ -6220,10 +6221,12 @@ fn codex_completion_requires_an_accepted_bound_result() {
         }
         let terminal = emitted.iter().position(|event| event.event_type == "run.terminal").unwrap();
         if accepted_report {
-            let result = emitted.iter().position(|event| event.event_type == "run.result.proposed").unwrap();
-            assert!(result < terminal);
-            assert_eq!(emitted[result].payload, input);
+            // The controller commits the accepted semantic result before its
+            // response; the provider records that authority, not a second proposal.
+            assert!(!emitted.iter().any(|event| event.event_type == "run.result.proposed"));
             assert_eq!(emitted[terminal].payload["runTerminalState"], "succeeded");
+            assert_eq!(emitted[terminal].payload["reportedWorkDisposition"], "done");
+            assert!(!emitted.iter().any(|event| event.event_type == "session.failed"));
             assert_eq!(inputs, 1);
             assert_eq!(call_count(&directory, "terminal-result:accepted"), 1);
         } else {
