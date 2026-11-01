@@ -23,11 +23,6 @@ const support = await getEmbeddedPostgresTestSupport();
 
   type Fixture = Awaited<ReturnType<typeof seed>>;
 
-  /**
-   * The production shape of a stage handoff: the outgoing run was cancelled
-   * for the reassignment, its provider stop was acknowledged, and its
-   * environment lease is still held while executor cleanup runs.
-   */
   async function seed(input: { stage?: boolean } = {}) {
     const stage = input.stage ?? true;
     const companyId = randomUUID(), previousAgentId = randomUUID(), nextAgentId = randomUUID();
@@ -64,7 +59,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const [lease] = await db.insert(environmentLeases).values({
       companyId, issueId, heartbeatRunId: runId, status: "active", provider: "local",
     }).returning();
-    // Occupy the next agent so admission queues its run without launching a provider.
     const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId: nextAgentId, status: "running" }).returning();
     const executionStage = {
       stageId, wakeRole: "reviewer", stageType: "review", reviewRequest,
@@ -132,7 +126,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seed();
     const { heartbeat, parked } = await parkWake(f);
 
-    // Cleanup has not finished: nothing to admit yet.
     await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
     expect(await nextAgentIssueRuns(f)).toHaveLength(0);
     expect((await nextAgentWakes(f))[0]!.status).toBe("deferred_issue_execution");
@@ -211,9 +204,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seed();
     const { parked } = await parkWake(f);
     await releaseLease(f);
-    // The sweep rotates receipts on a cadence; age this one past it.
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, parked.id));
-    // New service instances have only the persisted receipt, as after restart.
     await Promise.all([heartbeatService(db).resumeExecutionOwnershipWaits(), heartbeatService(db).resumeExecutionOwnershipWaits()]);
     const runs = await nextAgentIssueRuns(f);
     expect(runs).toHaveLength(1);
@@ -242,8 +233,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const transaction = db.transaction.bind(db);
     let transactions = 0;
     let merged = false;
-    // Commit the same row update as coalescing, after the sweep has selected
-    // its old snapshot, at each of the two issue-lock boundaries.
     const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
       if (transactions++ === (phase === "eligibility" ? 0 : 1)) {
         spy.mockRestore();
@@ -356,7 +345,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const due = new Date(Date.now() - 60_000);
     await db.update(agentWakeupRequests).set({ updatedAt: due }).where(eq(agentWakeupRequests.id, handoff.id));
 
-    // Leave the lease held so ordinary admission does not yet adopt comments.
     await heartbeat.resumeExecutionOwnershipWaits();
     const after = await nextAgentWakes(f);
     expect(after.find(wake => wake.id === handoff.id)!.updatedAt.getTime()).toBeGreaterThan(due.getTime());
@@ -461,6 +449,108 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "cancelled" });
     expect(await nextAgentIssueRuns(f)).toHaveLength(0);
   });
-
+  describe("shared ownership-wait worker", () => {
+    const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
+    let calls: number;
+    let observed: typeof db;
+    let draining: boolean;
+    const errors: unknown[] = [];
+    beforeEach(async () => {
+      await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
+      calls = 0; draining = false; errors.length = 0;
+      observed = new Proxy(db, { get(target, key) {
+        if (!["select", "update", "insert", "delete", "execute", "transaction"].includes(String(key))) return Reflect.get(target, key);
+        return (...args: unknown[]) => { calls++; return Reflect.apply(Reflect.get(target, key), target, args); };
+      } });
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], shouldAdvanceTime: true });
+    });
+    afterEach(async () => {
+      for (const c of coordinators.splice(0)) await c.stop();
+      vi.useRealTimers();
+    });
+    async function start() {
+      const heartbeat = heartbeatService(observed);
+      const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining,
+        canReconcile: () => true, onError: error => { errors.push(error); } });
+      coordinators.push(c);
+      await heartbeat.registerDeferredReceiptWork(c, () => !draining).ready;
+      return c;
+    }
+    async function settle() {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0), { timeout: 5000 });
+      expect(errors).toEqual([]);
+    }
+    async function quiet(c: Awaited<ReturnType<typeof start>>) {
+      await settle();
+      expect(c.nextWakeAt()).toBeNull();
+      const before = calls;
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(calls).toBe(before);
+    }
+    it("does no recurring database work when empty or settled, and the first real producer wakes it", async () => {
+      const c = await start();
+      await quiet(c);
+      const f = await seed();
+      await parkWake(f);
+      await settle();
+      expect(c.nextWakeAt()).not.toBeNull();
+      expect(await nextAgentIssueRuns(f)).toHaveLength(0);
+      await releaseLease(f);
+      await settle();
+      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+      await quiet(c);
+      const restarted = await start();
+      await quiet(restarted);
+    });
+    it("reconstructs pending receipts at startup and two workers admit only one successor", async () => {
+      const f = await seed();
+      const { parked } = await parkWake(f);
+      await releaseLease(f);
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
+        .where(eq(agentWakeupRequests.id, parked.id));
+      const workers = await Promise.all([start(), start()]);
+      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+      for (const c of workers) await quiet(c);
+    });
+    it.each([false, true])("observes nested admission only after outer settlement (rollback=%s)", async rollback => {
+      const c = await start();
+      await quiet(c);
+      const f = await seed();
+      const before = calls;
+      const write = db.transaction(async tx => {
+        expect(await heartbeatService(tx as unknown as typeof db).wakeup(f.nextAgentId, f.wake)).toBeNull();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(calls).toBe(before);
+        if (rollback) throw new Error("rollback admission");
+      });
+      if (rollback) await expect(write).rejects.toThrow("rollback admission");
+      else await write;
+      await releaseLease(f);
+      await settle();
+      expect(await nextAgentIssueRuns(f)).toHaveLength(rollback ? 0 : 1);
+      await quiet(c);
+    });
+    it("retains a committed wake during drain without database polling, then resumes once", async () => {
+      const c = await start();
+      await quiet(c);
+      const f = await seed();
+      draining = true;
+      await parkWake(f);
+      await releaseLease(f);
+      const before = calls;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls).toBe(before);
+      draining = false;
+      await settle();
+      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+      await quiet(c);
+      await c.stop();
+      const stoppedCalls = calls;
+      await parkWake(await seed());
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls).toBe(stoppedCalls);
+    });
+  });
 });
 
