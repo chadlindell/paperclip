@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
+import * as runtimeMaterializer from "../drivers/runtime-context-materializer.js";
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
 import { createCapabilityRunnerdCodexTransport } from "./runnerd-codex-transport.js";
 
@@ -79,3 +80,130 @@ it.each(["settled", "rejected", "timeout"] as const)("joins admitted resume prep
     await rm(root, { recursive: true, force: true });
   }
 }, 5_000);
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function registeredFixture(releaseRoute: () => Promise<void>, registrationGate?: Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), "runner-detach-owned-core-"));
+  const entered = deferred();
+  let core!: DurablePrpControlPlane;
+  const materialize = vi.spyOn(runtimeMaterializer, "prepareIsolatedCodexHome").mockResolvedValue(undefined);
+  const bundle = createCapabilityRunnerdCodexTransport({
+    stateDirectory: root, runnerBinary: "/fixture/runnerd", codexCommand: "/fixture/codex", closeGraceMs: 100,
+    runnerArtifact: { version: "0.3.0", digest: `sha256:${"a".repeat(64)}` },
+    controlPlaneRegistration: async authority => {
+      core = authority;
+      await core.start();
+      entered.resolve();
+      await registrationGate;
+      return { connectUrl: core.connectUrl, release: releaseRoute };
+    },
+    runnerProcessLauncher: () => { throw new Error("fixture launch stopped"); },
+  });
+  const opening = bundle.transport.request("thread/start", { cwd: root, dynamicTools: [] });
+  void opening.catch(() => undefined);
+  await entered.promise;
+  if (!registrationGate) await expect(opening).rejects.toThrow("fixture launch stopped");
+  return { bundle, core, root, opening, async cleanup() {
+    await opening.catch(() => undefined);
+    await bundle.transport.close().catch(() => undefined);
+    await core.stop().catch(() => undefined);
+    materialize.mockRestore();
+    await rm(root, { recursive: true, force: true });
+  } };
+}
+
+async function boundedOutcome(operation: Promise<void>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation.then(() => ({ error: null }), error => ({ error: error as Error })),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("fixture retirement never settled")), 700); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+it.each(["stopped", "stop-failed"] as const)("still retires an existing core after startup join timeout (%s)", async mode => {
+  const gate = deferred();
+  const fixture = await registeredFixture(async () => {}, gate.promise);
+  const stop = vi.spyOn(fixture.core, "stop");
+  if (mode === "stop-failed") stop.mockRejectedValueOnce(new Error("fixture stop failed"));
+  try {
+    const next = fixture.bundle.transport.notifications()[Symbol.asyncIterator]().next();
+    const result = await boundedOutcome(fixture.bundle.detachControllerForRestart());
+    expect(result.error?.message).toContain("startup drain timed out");
+    expect(stop).toHaveBeenCalled();
+    if (mode === "stop-failed") {
+      expect(result.error).toBeInstanceOf(AggregateError);
+      expect(JSON.stringify((result.error as AggregateError).errors, (_key, value) => value instanceof Error ? { message: value.message, errors: (value as AggregateError).errors } : value)).toContain("fixture stop failed");
+    }
+    await expect(next).resolves.toMatchObject({ done: true });
+  } finally {
+    gate.resolve();
+    stop.mockRestore();
+    await fixture.cleanup();
+  }
+});
+
+it.each(["held", "failed", "held-stop"] as const)("rejects unconfirmed retirement while still attempting all cleanup (%s)", async mode => {
+  const gate = deferred();
+  const release = vi.fn(async () => {
+    if (mode === "held") await gate.promise;
+    if (mode === "failed") throw new Error("fixture route release failed");
+  });
+  const fixture = await registeredFixture(release);
+  const originalStop = fixture.core.stop.bind(fixture.core);
+  const stop = vi.spyOn(fixture.core, "stop");
+  if (mode === "held-stop") stop.mockImplementationOnce(async () => { await gate.promise; await originalStop(); });
+  try {
+    const next = fixture.bundle.transport.notifications()[Symbol.asyncIterator]().next();
+    const result = await boundedOutcome(fixture.bundle.detachControllerForRestart());
+    expect(result.error?.message).toMatch(mode === "failed" ? /fixture route release failed/ : /timed out/);
+    expect(release).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalled();
+    await expect(next).resolves.toMatchObject({ done: true });
+    await expect(fixture.bundle.detachControllerForRestart()).rejects.toThrow();
+  } finally {
+    gate.resolve();
+    stop.mockRestore();
+    await fixture.cleanup();
+  }
+});
+
+it.each(["settled", "failed"] as const)("joins an existing close without converting its outcome to detach success (%s)", async mode => {
+  const gate = deferred();
+  const releasing = deferred();
+  const fixture = await registeredFixture(async () => {
+    releasing.resolve();
+    await gate.promise;
+    if (mode === "failed") throw new Error("fixture close release failed");
+  });
+  const closing = fixture.bundle.transport.close();
+  void closing.catch(() => undefined);
+  try {
+    await releasing.promise;
+    let detached = false;
+    const detaching = fixture.bundle.detachControllerForRestart().then(() => { detached = true; });
+    void detaching.catch(() => undefined);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const completedBeforeClose = detached;
+    gate.resolve();
+    if (mode === "failed") {
+      await expect(closing).rejects.toThrow("fixture close release failed");
+      await expect(detaching).rejects.toThrow("fixture close release failed");
+      await expect(fixture.bundle.detachControllerForRestart()).rejects.toThrow("fixture close release failed");
+    } else {
+      await closing;
+      await detaching;
+    }
+    expect(completedBeforeClose).toBe(false);
+  } finally {
+    gate.resolve();
+    await closing.catch(() => undefined);
+    await fixture.cleanup();
+  }
+});
