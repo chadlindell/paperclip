@@ -26,7 +26,6 @@ import {
   mergeCoalescedContextSnapshot,
   enrichWakeContextSnapshot,
   hasInteractionContinuationWakeContext,
-  INTERACTION_CONTINUATION_CONTEXT_KEYS,
   isInteractionResolutionWakePayload,
 } from "./run-preparation.js";
 import { resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
@@ -79,6 +78,8 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { DEFERRED_WAKE_CONTEXT_KEY, EXECUTION_OWNER_ACTIVE_CAUSE, deferredExecutionOwnershipWaitPredicate } from "./ownership-wait-predicate.js";
+export { DEFERRED_WAKE_CONTEXT_KEY, EXECUTION_OWNER_ACTIVE_CAUSE, deferredExecutionOwnershipWaitPredicate } from "./ownership-wait-predicate.js";
 import {
   and,
   asc,
@@ -244,10 +245,6 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 
-export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-
-export const EXECUTION_OWNER_ACTIVE_CAUSE = "execution_owner_active";
-
 export function isDeferredExecutionOwnershipWait(payload: unknown): boolean {
   const parsed = parseObject(payload);
   const wait = parseObject(parsed.executionWait);
@@ -277,24 +274,6 @@ export function executionOwnershipWaitAppliesToIssue(
     ? state?.status === "changes_requested" && state.currentStageId === stageId
     : state?.status === "pending" && state.currentStageId === stageId;
   return stageApplies && principal?.type === "agent" && principal.agentId === agentId;
-}
-
-export function deferredExecutionOwnershipWaitPredicate() {
-  const payload = agentWakeupRequests.payload;
-  const context = sql`${payload}->${DEFERRED_WAKE_CONTEXT_KEY}`;
-  return and(
-    eq(agentWakeupRequests.status, "deferred_issue_execution"),
-    sql`${payload}->'executionWait'->>'cause' = ${EXECUTION_OWNER_ACTIVE_CAUSE}`,
-    sql`${payload}->'executionWait'->>'recoveryActionId' is null`,
-    sql`${payload}->>'queuedCommentInterrupt' is null`,
-    sql`${payload}->>'taskRetry' is null`,
-    sql`nullif(btrim(${payload}->>'commentId'), '') is null`,
-    sql`coalesce(nullif(${context}->'wakeCommentIds', 'null'::jsonb), '[]'::jsonb) = '[]'::jsonb`,
-    sql`btrim(${payload}->>'mutation') is distinct from 'interaction'`,
-    ...["wakeCommentId", "nativeStatusWakeIntentId", ...INTERACTION_CONTINUATION_CONTEXT_KEYS].map(
-      (key) => sql`nullif(btrim(${context}->>${key}), '') is null`,
-    ),
-  );
 }
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [

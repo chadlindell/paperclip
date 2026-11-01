@@ -1,4 +1,5 @@
 import { skillPackageStore, skillVersionMetadataColumns } from "../skill-package-store.js";
+import { INTERACTION_CONTINUATION_CONTEXT_KEYS } from "./ownership-wait-predicate.js";
 import { skillAccessService } from "../skill-access.js";
 import { buildReviewPathRecoveryDisposition } from "../recovery/review-path-recovery.js";
 import type { AuthorizationActor } from "../authorization.js";
@@ -1725,15 +1726,7 @@ export function enrichWakeContextSnapshot(input: {
   };
 }
 
-export const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
-  "interactionId",
-  "interactionKind",
-  "interactionStatus",
-  "continuationPolicy",
-  "checkboxSelection",
-  "itemVerdicts",
-  "newlyResolvedItemIds",
-] as const;
+export { INTERACTION_CONTINUATION_CONTEXT_KEYS } from "./ownership-wait-predicate.js";
 
 export function isInteractionResolutionWakePayload(
   payload: Record<string, unknown> | null | undefined,

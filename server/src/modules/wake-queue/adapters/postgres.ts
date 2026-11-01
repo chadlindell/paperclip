@@ -14,6 +14,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
+import { deferredExecutionOwnershipWaitPredicate } from "../../../services/heartbeat/ownership-wait-predicate.js";
 import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import type { Db } from "@paperclipai/db";
@@ -238,7 +239,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               interruptQueueId ? undefined
-                : sql`${agentWakeupRequests.payload}#>>'{executionWait,cause}' is distinct from 'execution_owner_active'`,
+                : sql`not (${deferredExecutionOwnershipWaitPredicate()})`,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               excludedAgentId ? ne(agentWakeupRequests.agentId, excludedAgentId) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
