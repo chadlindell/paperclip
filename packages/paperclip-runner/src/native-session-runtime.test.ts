@@ -1280,7 +1280,7 @@ describe("executeNativeSession recovery", () => {
   });
 
   it.each((["complete", "paused", "blocked", "cleared"] as const).flatMap(status =>
-    (["new_turn", "same_turn_replay", "initial_start_replay", "fresh_report", "missing_start_id", "missing_report_id"] as const)
+    (["new_turn", "same_turn_replay", "initial_start_replay", "fresh_report", "missing_start_id", "missing_report_id", "late_old_report", "late_old_after_fresh", "late_unidentified_report"] as const)
       .map(order => ({ status, order }))))
   ("scopes goal completion authority to its provider turn ($status, $order)", async ({ status, order }) => {
     const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
@@ -1290,7 +1290,8 @@ describe("executeNativeSession recovery", () => {
     const close = vi.fn(async () => {}), completeRun = vi.fn(async () => {});
     const goal = vi.fn(async () => active);
     const preserved = order === "same_turn_replay" || order === "initial_start_replay";
-    const reported = preserved || order === "fresh_report";
+    const hasFreshReport = order === "fresh_report" || order === "late_old_after_fresh";
+    const reported = preserved || hasFreshReport;
     const session: NativeSession = {
       identity: () => identity, capabilities: async () => capabilities,
       startTurn: async () => ({ turnId: "provider-turn-1" }), goal,
@@ -1305,7 +1306,11 @@ describe("executeNativeSession recovery", () => {
         yield event("turn.completed", "provider-turn-1");
         const nextTurn = preserved || order === "missing_report_id" ? "provider-turn-1" : "provider-turn-2";
         yield event("turn.started", order === "missing_start_id" ? undefined : nextTurn);
-        if (order === "fresh_report") yield event("run.result.proposed", nextTurn, fresh);
+        if (hasFreshReport) yield event("run.result.proposed", nextTurn, fresh);
+        if (order === "late_old_report" || order === "late_old_after_fresh") {
+          yield event("run.result.proposed", "provider-turn-1", result);
+        }
+        if (order === "late_unidentified_report") yield event("run.result.proposed", undefined, result);
         // Clearing can arrive while the next turn is still active. Its missing
         // workingNow must not resurrect an earlier turn's fulfilled contract.
         if (status !== "cleared") yield event("turn.completed", nextTurn);
@@ -1326,7 +1331,7 @@ describe("executeNativeSession recovery", () => {
       await expect(run).rejects.toMatchObject({ code: "native_provider_terminal_failed", providerCode: "semantic_completion_missing", recoverable: false });
       expect(completeRun).not.toHaveBeenCalled();
     } else if (reported) {
-      await expect(run).resolves.toMatchObject({ result: order === "fresh_report" ? fresh : result });
+      await expect(run).resolves.toMatchObject({ result: hasFreshReport ? fresh : result });
       expect(completeRun).toHaveBeenCalledOnce();
     } else {
       await expect(run).resolves.toMatchObject({ result: {
