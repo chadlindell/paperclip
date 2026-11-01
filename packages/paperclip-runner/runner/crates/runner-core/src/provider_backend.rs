@@ -817,10 +817,9 @@ fn terminal_events(
     // bounded controller finalizer may interrupt the provider after the result
     // proposal. That provider terminal closes the exact turn; it does not
     // revoke the already-authoritative semantic outcome.
-    let succeeded = goal_status == Some("complete")
-        || (goal_status.is_none()
-            && (event_type == "turn.completed"
-                || state.active_provider_result_fingerprint.is_some()));
+    let succeeded = state.active_provider_result_fingerprint.is_some()
+        || goal_status == Some("complete")
+        || (goal_status.is_none() && event_type == "turn.completed");
     let cancelled = matches!(event_type, "turn.cancelled" | "turn.interrupted");
     let disposition = state
         .active_provider_result_disposition
@@ -5881,15 +5880,22 @@ mod tests {
             for event_type in ["turn.completed", "turn.interrupted", "turn.cancelled"] {
                 assert!(terminal_events(&state, event_type, Some("active")).is_empty());
                 for goal in [
-                    None, Some("complete"), Some("paused"), Some("blocked"),
-                    Some("limited"), Some("usage_limited"), Some("budget_limited"),
+                    None,
+                    Some("complete"),
+                    Some("paused"),
+                    Some("blocked"),
+                    Some("limited"),
+                    Some("usage_limited"),
+                    Some("budget_limited"),
                 ] {
                     let events = terminal_events(&state, event_type, goal);
                     assert_eq!(events.len(), 1);
                     assert_eq!(events[0].event_type, "run.terminal");
                     assert_eq!(events[0].payload["reportedWorkDisposition"], disposition);
-                    assert_eq!(events[0].payload["runTerminalState"], "succeeded",
-                        "accepted {disposition}, {event_type}, goal {goal:?}");
+                    assert_eq!(
+                        events[0].payload["runTerminalState"], "succeeded",
+                        "accepted {disposition}, {event_type}, goal {goal:?}"
+                    );
                 }
             }
         }
