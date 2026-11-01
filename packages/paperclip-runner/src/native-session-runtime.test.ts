@@ -1009,7 +1009,9 @@ describe("executeNativeSession recovery", () => {
         };
       },
       async *events() {
-        yield runnerEvent(1, cleared ? "session.goal.cleared" : "session.goal.updated", {
+        let seq = 0;
+        if (recoveryOnly && !cleared) yield runnerEvent(++seq, "run.result.proposed", result);
+        yield runnerEvent(++seq, cleared ? "session.goal.cleared" : "session.goal.updated", {
           requestId,
           goal: cleared ? null : {
             objective: pausedGoal.objective,
@@ -1020,8 +1022,8 @@ describe("executeNativeSession recovery", () => {
           },
           workingNow: !recoveryOnly,
         });
-        yield runnerEvent(2, "turn.completed");
-        yield runnerEvent(3, "session.goal.snapshot", {
+        yield runnerEvent(++seq, "turn.completed");
+        yield runnerEvent(++seq, "session.goal.snapshot", {
           goal: cleared ? null : {
             objective: pausedGoal.objective,
             status: pausedGoal.status,
@@ -1310,7 +1312,8 @@ describe("executeNativeSession recovery", () => {
           });
           yield runnerEvent(3, "session.goal.updated", { goal: { ...activeGoal, status }, workingNow: false });
           yield runnerEvent(4, "turn.completed");
-          yield runnerEvent(5, "session.goal.snapshot", { goal: completeGoal, workingNow: false });
+          if (recoverable) yield runnerEvent(5, "run.result.proposed", result);
+          yield runnerEvent(recoverable ? 6 : 5, "session.goal.snapshot", { goal: completeGoal, workingNow: false });
         },
         startTurn, goal,
         async result() { return null; },

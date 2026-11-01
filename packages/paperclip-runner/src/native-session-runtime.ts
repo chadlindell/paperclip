@@ -1508,36 +1508,34 @@ function sessionGoalResult(
   reason: string,
 ): PrpStructuredRunResult {
   const status = goalStatus(goal);
+  if (status === "complete") {
+    // Callers prefer an accepted semantic report. A later provider-goal update
+    // is lifecycle state, not evidence that this task's contract was fulfilled.
+    throw new NativeProviderTerminalFailure("semantic_completion_missing", false,
+      "The provider goal completed without an accepted completion report.");
+  }
   const objective = goal?.objective ?? input.completionContract.contract.objective;
-  const disposition = status === "complete"
-    ? "done"
-    : status === "blocked"
+  const disposition = status === "blocked"
       ? "blocked"
       : "yielded";
   const result: PrpStructuredRunResult = {
     schema: "paperclip.run_result.v1",
     reportedWorkDisposition: disposition,
-    summary: status === "complete"
-      ? `Session goal completed: ${objective}`
-      : status === "blocked"
+    summary: status === "blocked"
         ? `Session goal blocked: ${objective}`
         : `Session goal yielded (${status ?? "cleared"}): ${objective}`,
     completionClaim: {
       contractRevision: input.completionContract.contract.revision,
-      objectiveSatisfied: status === "complete",
+      objectiveSatisfied: false,
       criteria: input.completionContract.contract.criteria.map((criterion) => ({
         criterionId: criterion.id,
-        status: status === "complete" ? "satisfied" : "unknown",
-        evidenceRefs: status === "complete" ? ["session-goal:complete"] : [],
+        status: "unknown",
+        evidenceRefs: [],
         explanation: `Provider session goal status: ${status ?? "cleared"}.`,
       })),
-      remainingWork: status === "complete"
-        ? []
-        : [{ description: reason, blocksCompletion: true }],
+      remainingWork: [{ description: reason, blocksCompletion: true }],
     },
-    evidence: status === "complete"
-      ? [{ kind: "session_goal_status", ref: "session-goal:complete" }]
-      : [],
+    evidence: [],
     verification: [],
     attentionRequests: [],
     artifacts: [],
