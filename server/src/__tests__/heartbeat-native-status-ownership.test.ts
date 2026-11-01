@@ -178,6 +178,62 @@ describe("native status continuation behind outgoing ownership", () => {
     expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
   });
 
+  it("keeps a fresh post-Stop continuation distinct from a held pre-Stop intent in the same batch", async () => {
+    const f = await fixture();
+    const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      resultJson: { executionCancellation: { state: "acknowledged" },
+        cancellation: { source: "operator", reason: "Stopped by operator", expected: true } },
+    }).returning();
+    // A later explicitly resumed run produces a distinct real committer intent.
+    // Leave both outbox entries undispatched to exercise one delivery batch.
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [result] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.runId));
+    const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, f.assessmentId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const freshRunId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
+    await db.insert(heartbeatRuns).values({ ...source, id: freshRunId, startedAt: new Date(), finishedAt: new Date() });
+    await db.insert(nativeRunResults).values({ ...result, id: resultId, runId: freshRunId,
+      serverFingerprint: `fresh:${freshRunId}`, canonicalSha256: `fresh:${freshRunId}` });
+    await db.insert(workAssessments).values({ ...assessment, id: assessmentId, runId: freshRunId, resultId,
+      priorStatusVersion: issue.statusVersion, priorDecisionId: issue.lastStatusDecisionId, inputDigest: `fresh:${freshRunId}` });
+    await db.insert(nativeRunFinalizations).values({ runId: freshRunId, companyId: f.companyId, issueId: f.issueId,
+      phase: "assessing", resultId, assessmentId });
+    const committed = await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId,
+      runId: freshRunId, assessmentId, priorStatus: issue.status, priorStatusVersion: issue.statusVersion,
+      priorDecisionId: issue.lastStatusDecisionId,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
+        reasonCode: "live_continuation_registered", unblockDescriptor: null,
+        effects: [{ kind: "enqueue_continuation", continuationKind: "same_agent", agentId: f.agentId,
+          summary: "Continue explicitly resumed work", idempotencyKey: `fresh:${freshRunId}` }] } });
+    const [effect] = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id));
+    expect(effect).toMatchObject({ effectKind: "enqueue_continuation", deliveryState: "delivered" });
+    const fresh = { ...f, intentId: effect.targetId! };
+    expect(fresh.intentId).not.toBe(f.intentId);
+    const [freshIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, fresh.intentId));
+    expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
+    await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const [oldSaved] = await dispatches(f);
+    expect(oldSaved).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    const [freshSaved] = await dispatches(fresh);
+    expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
+      payload: { _paperclipWakeContext: { nativeStatusWakeIntentId: fresh.intentId } } });
+    expect(freshSaved.id).not.toBe(oldSaved.id);
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
+    const worker = await start();
+    const admitted = (await successors(f)).filter(run => ![stopped.id, freshRunId].includes(run.id));
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]).toMatchObject({ status: "queued", contextSnapshot: { nativeStatusWakeIntentId: fresh.intentId } });
+    expect((await dispatches(f))[0]).toMatchObject({ id: oldSaved.id, status: "deferred_issue_execution", runId: null });
+    expect((await dispatches(fresh))[0]).toMatchObject({ id: freshSaved.id, status: "queued", runId: admitted[0].id });
+    await worker.stop();
+    await start();
+    expect((await successors(f)).filter(run => ![stopped.id, freshRunId].includes(run.id))).toHaveLength(1);
+  });
+
   it("does not promote a former assignee's older native receipt ahead of the current assignee", async () => {
     const f = await fixture();
     const first = await start();
