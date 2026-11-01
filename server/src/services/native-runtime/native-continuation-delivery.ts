@@ -15,7 +15,7 @@ export async function hasDeferredNativeWakeStop(db: Db,
       wake.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return false;
   const stopped = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId), eq(heartbeatRuns.status, "cancelled"),
-    eq(boundRunIssueIdSql(), issueId), sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) >= ${wake.requestedAt}`,
+    eq(boundRunIssueIdSql(), issueId), sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) >= ${wake.requestedAt.toISOString()}::timestamptz`,
     or(eq(heartbeatRuns.runtimeMode, "native"), sql`not exists (select 1 from ${agentWakeupRequests} interrupt
       where interrupt.company_id = ${wake.companyId} and interrupt.agent_id = ${wake.agentId}
         and interrupt.id::text = ${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId'
