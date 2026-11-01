@@ -170,7 +170,7 @@ describe("native status continuation behind outgoing ownership", () => {
     const worker = await start();
     const [saved] = await dispatches(f);
     expect(saved).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
+    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopped!.finishedAt!.getTime());
     await worker.stop();
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
@@ -178,8 +178,9 @@ describe("native status continuation behind outgoing ownership", () => {
     expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
   });
 
-  it.each(["acknowledged", "late_acknowledged", "none"])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stopMode => {
+  it.each(["acknowledged", "late_acknowledged", "none", "submillisecond"])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stopMode => {
     const f = await fixture();
+    const separatesStop = stopMode !== "none" && stopMode !== "submillisecond";
     const [stopped] = stopMode !== "none" ? await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
       resultJson: { executionCancellation: { state: stopMode === "late_acknowledged" ? "requested" : "acknowledged" },
@@ -210,16 +211,27 @@ describe("native status continuation behind outgoing ownership", () => {
     const [effect] = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id));
     expect(effect).toMatchObject({ effectKind: "enqueue_continuation", deliveryState: "delivered" });
     const fresh = { ...f, intentId: effect.targetId! };
+    if (stopMode === "submillisecond") {
+      // Both intents follow Stop, but the first is within its millisecond.
+      // Preserve actual PostgreSQL precision instead of JS Date rounding.
+      const second = new Date(Date.now() - 10_000).toISOString().slice(0, 19);
+      await db.update(heartbeatRuns).set({ finishedAt: sql`${second + ".123000Z"}::timestamptz` })
+        .where(eq(heartbeatRuns.id, stopped!.id));
+      await db.update(agentWakeupRequests).set({ requestedAt: sql`${second + ".123500Z"}::timestamptz` })
+        .where(eq(agentWakeupRequests.id, f.intentId));
+      await db.update(agentWakeupRequests).set({ requestedAt: sql`${second + ".124500Z"}::timestamptz` })
+        .where(eq(agentWakeupRequests.id, fresh.intentId));
+    }
     expect(fresh.intentId).not.toBe(f.intentId);
     const [freshIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, fresh.intentId));
-    if (stopped) expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
+    if (separatesStop) expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopped!.finishedAt!.getTime());
     await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     const [oldSaved] = await dispatches(f);
     expect(oldSaved).toMatchObject({ status: "deferred_issue_execution", runId: null });
     const [freshSaved] = await dispatches(fresh);
-    if (stopped) expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
+    if (separatesStop) expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
       payload: { _paperclipWakeContext: { nativeStatusWakeIntentId: fresh.intentId } } });
-    if (stopped) expect(freshSaved.id).not.toBe(oldSaved.id);
+    if (separatesStop) expect(freshSaved.id).not.toBe(oldSaved.id);
     // Remote termination can acknowledge an already-cancelled run later,
     // preserving its original finishedAt outside the issue lock.
     if (stopped && stopMode === "late_acknowledged") await db.update(heartbeatRuns).set({
@@ -232,9 +244,9 @@ describe("native status continuation behind outgoing ownership", () => {
     const worker = await start();
     const admitted = (await successors(f)).filter(run => ![stopped?.id, freshRunId].includes(run.id));
     expect(admitted).toHaveLength(1);
-    expect(admitted[0]).toMatchObject({ status: "queued", contextSnapshot: { nativeStatusWakeIntentId: stopped ? fresh.intentId : f.intentId } });
-    if (stopped) expect((await dispatches(f))[0]).toMatchObject({ id: oldSaved.id, status: "deferred_issue_execution", runId: null });
-    if (stopped) expect((await dispatches(fresh))[0]).toMatchObject({ id: freshSaved.id, status: "queued", runId: admitted[0].id });
+    expect(admitted[0]).toMatchObject({ status: "queued", contextSnapshot: { nativeStatusWakeIntentId: separatesStop ? fresh.intentId : f.intentId } });
+    if (separatesStop) expect((await dispatches(f))[0]).toMatchObject({ id: oldSaved.id, status: "deferred_issue_execution", runId: null });
+    if (separatesStop) expect((await dispatches(fresh))[0]).toMatchObject({ id: freshSaved.id, status: "queued", runId: admitted[0].id });
     await worker.stop();
     // Finish the first successor while the task remains in progress, then
     // recover through the normal release adapter. A duplicate parked intent
@@ -246,7 +258,7 @@ describe("native status continuation behind outgoing ownership", () => {
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
       .where(eq(agentWakeupRequests.companyId, f.companyId));
     await start();
-    if (stopped) expect((await dispatches(f))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    if (separatesStop) expect((await dispatches(f))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
     expect((await successors(f)).filter(run => ![stopped?.id, freshRunId].includes(run.id))).toHaveLength(1);
   });
 
