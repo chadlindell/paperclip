@@ -11147,6 +11147,9 @@ describe("native session bounded recovery", () => {
         });
       expect(startTurn).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
       expect(completeRun).not.toHaveBeenCalled();
+      // Failure wins at turn completion before the result-less run terminal
+      // reaches the coordinator's stricter terminal-result validator.
+      expect(appended.map(event => event.eventType)).toEqual(["item.completed", "session.failed", "turn.completed"]);
       expect(appended.some(event => event.eventType === "run.result.proposed")).toBe(false);
       expect(updates.find(update => update.table === nativeRunFinalizations && update.values.phase === "terminal_failure")?.values)
         .toMatchObject({ failureCode: "native_provider_terminal_failed", nextAttemptAt: null, leaseOwner: null,
