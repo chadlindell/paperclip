@@ -1252,7 +1252,8 @@ describe("executeNativeSession recovery", () => {
       tokenBudget: null, tokensUsed: 100, timeUsedSeconds: 1, createdAt: 1, updatedAt: 2 };
     const accepted: PrpStructuredRunResult = disposition === "done" ? result : {
       ...yieldedResult, reportedWorkDisposition: disposition,
-      attentionRequests: disposition === "needs_review" ? [{ kind: "review", summary: "Review the reported output.", ownerClass: "agent" }] : [],
+      attentionRequests: disposition === "needs_review" ? [{ kind: "agent_handoff", summary: "Review the reported output.", ownerClass: "agent", targetAgentId: "reviewer" }] : [],
+      ...(disposition === "blocked" ? { blocker: { reasonCode: "external_input_required", owner: { kind: "external" as const, name: "Fixture input" }, unblockAction: "Supply fixture input.", scope: "current_track" as const } } : {}),
     };
     const close = vi.fn(async () => {}), completeRun = vi.fn(async () => {});
     const session: NativeSession = {

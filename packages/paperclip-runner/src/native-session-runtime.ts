@@ -1217,7 +1217,7 @@ async function consumeTurn(
             highestContiguousSourceSeq,
             governedResult:
               governedResult ??
-              (goalStatus(eventGoal) === "complete" ? semanticResultProposal : null) ??
+              semanticResultProposal ??
               sessionGoalResult(
                 input,
                 eventGoal,
@@ -1236,7 +1236,7 @@ async function consumeTurn(
               highestContiguousSourceSeq,
               governedResult:
                 governedResult ??
-                (goalStatus(latestSessionGoal) === "complete" ? semanticResultProposal : null) ??
+                semanticResultProposal ??
                 sessionGoalResult(
                   input,
                   latestSessionGoal,
