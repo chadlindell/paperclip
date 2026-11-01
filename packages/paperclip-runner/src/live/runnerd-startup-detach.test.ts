@@ -173,4 +173,3 @@ it.each(["held", "failed", "held-stop"] as const)("rejects unconfirmed retiremen
     await fixture.cleanup();
   }
 });
-
