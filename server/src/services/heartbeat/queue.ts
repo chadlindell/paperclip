@@ -245,6 +245,10 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 
+export function hasNativeStatusWakeIntent(payload: unknown): boolean {
+  return Boolean(readNonEmptyString(parseObject(parseObject(payload)[DEFERRED_WAKE_CONTEXT_KEY]).nativeStatusWakeIntentId));
+}
+
 export function isDeferredExecutionOwnershipWait(payload: unknown): boolean {
   const parsed = parseObject(payload);
   const wait = parseObject(parsed.executionWait);
@@ -1938,7 +1942,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+        sql`nullif(trim(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,nativeStatusWakeIntentId}'), '') is not null`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
@@ -1949,7 +1954,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+      if (!hasNativeStatusWakeIntent(wake.payload) && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
