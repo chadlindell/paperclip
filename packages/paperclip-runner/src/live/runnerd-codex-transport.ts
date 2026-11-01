@@ -4725,7 +4725,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     try {
       try {
         await this.#withinRetirementDeadline(() => Promise.allSettled(admitted), deadline, "startup drain");
-      } catch (error) { failures.push(error); }
+      } catch (error) {
+        this.#startupDrainTimedOut = true;
+        failures.push(error);
+      }
       if (this.#attachmentCleanupFailure) failures.push(this.#attachmentCleanupFailure);
       this.#core?.fenceSemanticToolCallbacks();
       // A timed-out join still owes cleanup, but cleanup success never erases
