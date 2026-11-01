@@ -323,21 +323,20 @@ describe("native status continuation behind outgoing ownership", () => {
     const until = performance.now() + 5000;
     while ((await successors(f)).length === 0 && performance.now() < until) await delay(20);
     expect(await successors(f)).toHaveLength(1);
-    for (let pass = 0; worker.nextWakeAt() !== null && pass < 3; pass++) {
-      await vi.advanceTimersByTimeAsync(Math.max(1, worker.nextWakeAt()! - Date.now()));
-      await delay(50);
+    // The scheduler removes a deadline when its pass starts. Wait for the
+    // tracked delivery promise as well, including real PostgreSQL settlement,
+    // before measuring idle queries; a null deadline alone is not quiescence.
+    const settleUntil = performance.now() + 5000;
+    while ((worker.nextWakeAt() !== null || idleWorkSnapshot().active > 0) && performance.now() < settleUntil) {
+      const deadline = worker.nextWakeAt();
+      if (deadline !== null) await vi.advanceTimersByTimeAsync(Math.max(1, deadline - Date.now()));
+      await delay(20);
     }
     expect(worker.nextWakeAt()).toBeNull();
-    const before = { ...idleWorkSnapshot(), now: Date.now(), next: worker.nextWakeAt() };
-    const samples: unknown[] = [];
-    const originalSelect = db.select.bind(db);
-    const reads = vi.spyOn(db, "select").mockImplementation((fields?: any) => {
-      samples.push({ now: Date.now(), idle: idleWorkSnapshot(), stack: new Error().stack });
-      return originalSelect(fields);
-    });
+    expect(idleWorkSnapshot().active).toBe(0);
+    const reads = vi.spyOn(db, "select");
     await vi.advanceTimersByTimeAsync(90_000);
     await delay(20);
-    console.info("idle-test-pass-evidence", JSON.stringify({ before, after: idleWorkSnapshot(), samples }));
     expect(reads).not.toHaveBeenCalled();
   });
 
