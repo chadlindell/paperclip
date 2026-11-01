@@ -6,6 +6,7 @@ import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import type { DeferredExecutionScope, DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { hasNativeStatusWakeIntent, isDeferredExecutionOwnershipWait } from "./queue.js";
+import { hasDeferredNativeWakeStop } from "../native-runtime/native-continuation-delivery.js";
 
 type Entry = { id: string; companyId: string; dueAt: number };
 type NativeIntentOptions = DeferredExecutionScope & {
@@ -122,12 +123,17 @@ export function registerDeferredReceiptWork(
           catch (error) { failed(error); }
           if (ownershipWait || nativeStatusWait) {
             const [remaining] = await db.select({ status: agentWakeupRequests.status,
-              payload: agentWakeupRequests.payload, updatedAt: agentWakeupRequests.updatedAt })
+              payload: agentWakeupRequests.payload, updatedAt: agentWakeupRequests.updatedAt,
+              companyId: agentWakeupRequests.companyId, agentId: agentWakeupRequests.agentId,
+              requestedAt: agentWakeupRequests.requestedAt, requestedByActorType: agentWakeupRequests.requestedByActorType,
+              requestedByActorId: agentWakeupRequests.requestedByActorId })
               .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
                 eq(agentWakeupRequests.id, entry.id)));
             if (remaining?.status === "deferred_issue_execution" &&
                 (isDeferredExecutionOwnershipWait(remaining.payload) || hasNativeStatusWakeIntent(remaining.payload))) {
-              next = Math.max(Date.now() + 30_000, remaining.updatedAt.getTime() + 30_000);
+              const issueId = remaining.payload?.issueId;
+              const stopped = nativeStatusWait && typeof issueId === "string" && await hasDeferredNativeWakeStop(db, remaining, issueId);
+              if (!stopped) next = Math.max(Date.now() + 30_000, remaining.updatedAt.getTime() + 30_000);
             }
           }
         }
