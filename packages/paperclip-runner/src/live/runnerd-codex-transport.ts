@@ -4692,9 +4692,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#resolveClosedSignal();
     this.#turnStartAdmission?.resolve(false);
     let startupTimer: ReturnType<typeof setTimeout> | undefined;
-    // Retire the journal writer before releasing waiting semantic handlers.
-    // Controller loss leaves their inputs pending for the successor; it must
-    // not manufacture cancellation results during old-controller cleanup.
+    // The synchronous semantic fence makes releasing waiters safe: their
+    // inputs remain pending for the successor. Successful retirement still
+    // requires joining startup, ingress and persistence below.
     try {
       if (startup !== null) {
         // Resume can still archive state or create its core after an admitted
