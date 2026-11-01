@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, ne } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { setTimeout as delay } from "node:timers/promises";
+import { and, eq, ne, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, agentWakeupRequests, companies, completionContracts, createDb, environmentLeases,
   heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, statusDecisionEffects, workAssessments,
@@ -20,8 +21,9 @@ describe("native status continuation behind outgoing ownership", () => {
     temporary = await startEmbeddedPostgresTestDatabase("native-status-ownership-");
     db = createDb(temporary.connectionString, { maxConnections: 6, idleTimeoutSeconds: 0, maxLifetimeSeconds: 0 });
     db.$client.options.onnotice = () => {};
+    await Promise.all(Array.from({ length: 6 }, () => db.execute(sql`select pg_sleep(0.01)`)));
   }, 90_000);
-  afterEach(async () => { for (const worker of workers.splice(0)) await worker.stop(); });
+  afterEach(async () => { for (const worker of workers.splice(0)) await worker.stop(); vi.useRealTimers(); vi.restoreAllMocks(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await temporary?.cleanup(); });
 
   async function fixture() {
@@ -64,7 +66,7 @@ describe("native status continuation behind outgoing ownership", () => {
     const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: outgoing.id,
       status: "active", provider: "local" }).returning();
     const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running" }).returning();
-    return { companyId, agentId, issueId, runId, outgoing, lease, busy, intentId: effect.targetId! };
+    return { companyId, agentId, issueId, runId, outgoing, lease, busy, assessmentId, decisionId: committed.decision.id, intentId: effect.targetId! };
   }
 
   async function start() {
@@ -122,4 +124,78 @@ describe("native status continuation behind outgoing ownership", () => {
     await heartbeatService(db).resumeQueuedRuns();
     expect(await successors(f)).toHaveLength(1);
   }, 30_000);
+
+  it("preserves a same-agent Stop even after a newer other-agent cancellation", async () => {
+    const f = await fixture();
+    const worker = await start();
+    const [saved] = await dispatches(f);
+    await worker.stop();
+    const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      resultJson: { executionCancellation: { state: "acknowledged" }, cancellation: { source: "board", reason: "Stopped by operator", expected: true } },
+    }).returning();
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    const afterStop = await start();
+    expect((await successors(f)).filter(run => run.id !== stopped.id)).toHaveLength(0);
+    await afterStop.stop();
+    const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.outgoing.agentId,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+    }).returning();
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    await start();
+    expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
+  });
+
+  it("does not promote a former assignee's older native receipt ahead of the current assignee", async () => {
+    const f = await fixture();
+    const first = await start();
+    await first.stop();
+    const [current] = await db.insert(agents).values({ companyId: f.companyId, name: "Current owner", status: "idle", adapterType: "process",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).returning();
+    const [occupied] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: current.id, status: "running" }).returning();
+    const [issue] = await db.update(issues).set({ assigneeAgentId: current.id }).where(eq(issues.id, f.issueId)).returning();
+    const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, f.assessmentId));
+    const [nextAssessment] = await db.insert(workAssessments).values({ ...assessment, id: randomUUID(), inputDigest: randomUUID(),
+      supersedesAssessmentId: assessment.id, priorStatusVersion: issue.statusVersion, priorDecisionId: issue.lastStatusDecisionId }).returning();
+    await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId, runId: f.runId,
+      assessmentId: nextAssessment.id, priorStatus: issue.status, priorStatusVersion: issue.statusVersion,
+      priorDecisionId: issue.lastStatusDecisionId, supersedesCommittedDecisionId: f.decisionId,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
+        reasonCode: "live_continuation_registered", unblockDescriptor: null,
+        effects: [{ kind: "notify_owner", agentId: current.id, reason: "issue_children_completed" }] } });
+    const parked = await start();
+    await parked.stop();
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.companyId, f.companyId));
+    await start();
+    const admitted = (await successors(f)).filter(run => run.id !== occupied.id);
+    expect(admitted.map(run => run.agentId)).toEqual([current.id]);
+  });
+
+  it("fires the retained deadline on a running worker and becomes quiet after delivery", async () => {
+    const f = await fixture();
+    const initial = await start();
+    await initial.stop();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    const worker = await start();
+    expect(await successors(f)).toHaveLength(0);
+    const next = worker.nextWakeAt();
+    expect(next).not.toBeNull();
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await vi.advanceTimersByTimeAsync(Math.max(1, next! - Date.now()));
+    const until = performance.now() + 5000;
+    while ((await successors(f)).length === 0 && performance.now() < until) await delay(20);
+    expect(await successors(f)).toHaveLength(1);
+    for (let pass = 0; worker.nextWakeAt() !== null && pass < 3; pass++) {
+      await vi.advanceTimersByTimeAsync(Math.max(1, worker.nextWakeAt()! - Date.now()));
+      await delay(50);
+    }
+    expect(worker.nextWakeAt()).toBeNull();
+    const reads = vi.spyOn(db, "select");
+    await vi.advanceTimersByTimeAsync(90_000);
+    await delay(20);
+    expect(reads).not.toHaveBeenCalled();
+  });
 });
