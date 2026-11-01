@@ -170,7 +170,7 @@ describe("native status continuation behind outgoing ownership", () => {
     const worker = await start();
     const [saved] = await dispatches(f);
     expect(saved).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopFinishedAt.getTime());
+    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
     await worker.stop();
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
