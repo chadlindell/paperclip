@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { and, asc, eq, ne, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -166,6 +168,35 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(runs).toHaveLength(1);
     expect(runs[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "issue_assigned", interruptedRunId: f.runId });
     expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
+  });
+
+  it("waits for the outgoing process after its lease is released", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(child, "spawn");
+    try {
+      const f = await seed({ stage: false });
+      await db.update(heartbeatRuns).set({ processPid: child.pid }).where(eq(heartbeatRuns.id, f.runId));
+      const { heartbeat } = await parkWake(f);
+      await releaseLease(f);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ cause: "execution_owner_active" });
+      await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
+      expect(await nextAgentIssueRuns(f)).toHaveLength(0);
+      const exited = once(child, "exit");
+      child.kill("SIGTERM");
+      await exited;
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      await Promise.all([
+        heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId }),
+        heartbeatService(db).resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId }),
+      ]);
+      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+      }
+    }
   });
 
   it("resumes a changes-requested handback to the executor while the reviewer remains the current participant", async () => {
