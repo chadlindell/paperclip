@@ -1245,6 +1245,40 @@ describe("executeNativeSession recovery", () => {
     },
   );
 
+  it.each([false, true])("requires a semantic report for goal completion arriving after the active turn (report=%s)", async reported => {
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const active = { threadId: "provider-recovery", objective: "Perform the assigned work", status: "active" as const,
+      tokenBudget: null, tokensUsed: 100, timeUsedSeconds: 1, createdAt: 1, updatedAt: 2 };
+    const close = vi.fn(async () => {}), completeRun = vi.fn(async () => {});
+    const goal = vi.fn(async () => active);
+    const session: NativeSession = {
+      identity: () => identity, capabilities: async () => capabilities,
+      startTurn: async () => ({ turnId: "turn-recovery" }), goal,
+      async *events() {
+        yield runnerEvent(1, "session.goal.updated", { goal: active, workingNow: true });
+        yield runnerEvent(2, "turn.completed");
+        if (reported) yield runnerEvent(3, "run.result.proposed", result);
+        yield runnerEvent(reported ? 4 : 3, "session.goal.updated", { goal: { ...active, status: "complete" }, workingNow: false });
+      },
+      result: async () => null,
+      snapshot: async () => ({ backendKind: "mock", sessionId: "late-goal", identity,
+        providerSessionId: active.threadId, cursor: null, activeTurnId: null, pendingRuntimeRequests: [], goal: active }), close,
+    };
+    const run = executeNativeSession({ input, backend: {
+      descriptor: async () => ({ kind: "mock", name: "late-goal", version: "1", capabilities }), openSession: async () => session,
+    }, controlPlane: { async openRun() {}, async checkpointSession() {},
+      async appendEvent(event) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun,
+    }, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" });
+    if (reported) {
+      await expect(run).resolves.toMatchObject({ result }); expect(completeRun).toHaveBeenCalledOnce();
+    } else {
+      await expect(run).rejects.toMatchObject({ code: "native_provider_terminal_failed", providerCode: "semantic_completion_missing", recoverable: false });
+      expect(completeRun).not.toHaveBeenCalled();
+    }
+    expect(goal).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { status: "active", code: "semantic_completion_rejected", recoverable: false },
     { status: "complete", code: "semantic_completion_rejected", recoverable: false },
