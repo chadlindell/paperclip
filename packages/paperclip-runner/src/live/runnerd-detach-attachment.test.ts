@@ -32,6 +32,7 @@ it.each([
     let attaching: Promise<void> | undefined;
     let detaching: Promise<void> | undefined;
     let detached = false;
+    let detachSettled = false;
     const providerLog = join(root, "provider-calls.log");
     const bundle = createCapabilityRunnerdCodexTransport({
       runnerBinary: defaultCapabilityRunnerdBinary(),
@@ -103,14 +104,16 @@ it.each([
       if (mode === "activation") {
         expect(core.store.state.commands.some(command => command.type === "run.attach" && command.status === "completed")).toBe(true);
       }
-      detaching = bundle.detachControllerForRestart().then(() => { detached = true; });
+      detaching = bundle.detachControllerForRestart()
+        .then(() => { detached = true; })
+        .finally(() => { detachSettled = true; });
       void detaching.catch(() => undefined);
       await new Promise(done => setTimeout(done, 100));
-      expect(detached, "detach must join the originally admitted attachment callback").toBe(false);
+      expect(detachSettled, "detach must join the originally admitted attachment callback").toBe(false);
       held.release();
       await releaseEntered.promise;
       await new Promise(done => setTimeout(done, 100));
-      expect(detached, "detach must also join that attachment's asynchronous route release").toBe(false);
+      expect(detachSettled, "detach must also join that attachment's asynchronous route release").toBe(false);
       releaseHeld.release();
       await expect(attaching).rejects.toThrow(/closed/);
       if (releaseFailure !== "none") {
