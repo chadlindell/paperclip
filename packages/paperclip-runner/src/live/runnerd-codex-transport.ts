@@ -3796,7 +3796,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    if (this.#closed) throw new Error("PRP Codex transport is closed");
+    if (this.#closed || this.#controllerDetachedForRestart) throw new Error("PRP Codex transport is closed");
     this.#throwIfFailed();
     if (this.#sourceRecoveryIdentity && !["initialize", "collaborationMode/list"].includes(method)) {
       throw new Error("native_runner_source_attachment_pending");
@@ -4676,6 +4676,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           )), Math.max(0, deadline - Date.now()));
         }),
       ]);
+      core.retireSemanticToolCallbacks();
     } finally {
       clearTimeout(timer);
     }
@@ -4685,10 +4686,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#closed) return;
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
     this.#controllerDetachedForRestart = true;
-    this.#closed = true;
-    this.#resolveClosedSignal();
-    this.#turnStartAdmission?.resolve(false);
-    await this.#retireControllerForRecovery(deadline);
+    // Retire the journal writer before releasing waiting semantic handlers.
+    // Controller loss leaves their inputs pending for the successor; it must
+    // not manufacture cancellation results during old-controller cleanup.
+    try {
+      await this.#retireControllerForRecovery(deadline);
+    } finally {
+      // A failed drain also closes this transport, but rejects detach so no
+      // successor is authorized to replace its unretired journal writer.
+      this.#closed = true;
+      this.#resolveClosedSignal();
+      this.#turnStartAdmission?.resolve(false);
+    }
     this.#handle = null;
     this.#diagnostic(
       "controller authority detached for restart; durable runner left alive",
@@ -4729,7 +4738,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   #assertStartupOpen(): void {
-    if (this.#closed) throw new Error("runnerd transport closed during provider startup");
+    if (this.#closed || this.#controllerDetachedForRestart) throw new Error("runnerd transport closed during provider startup");
   }
 
   async #closeOnce(): Promise<void> {
@@ -6310,7 +6319,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new SemanticToolNotDispatchedError();
     }
     const core = this.#core;
-    const threadId = this.#threadId;
+    const expectedThreadId = this.#threadId;
     const epoch = this.#turnStartResponseEpoch;
     const admission = this.#turnStartAdmission;
     // This callback runs independently of the notification pump. Do not copy
@@ -6339,9 +6348,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     } catch {
       throw new SemanticToolNotDispatchedError();
     }
+    // An adopted Runner can deliver a queued input before its authenticated
+    // provider identity is reconstructed. Bind that initially empty identity
+    // only after completed startup and handler publication; an existing thread
+    // binding must still match exactly.
+    const threadId = expectedThreadId || this.#threadId;
     if (
       !accepted ||
       this.#closed ||
+      !threadId ||
+      (!expectedThreadId && !this.#startupComplete) ||
       epoch !== this.#turnStartResponseEpoch ||
       threadId !== this.#threadId ||
       core === null ||

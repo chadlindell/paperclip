@@ -34,7 +34,7 @@ it.each(["none", "before-start", "after-start"] as const)("completes after the r
   const options = {
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: resolve(import.meta.dirname, "../../runner/target/debug/fake-codex-app-server"),
-    codexArgs: ["--state-file", join(root, "fake-state.json"), "--call-log", join(root, "calls.log"), "--durable-turn-ids", "--hold-first-durable-turn", "--terminal-result-file", reportPath],
+    codexArgs: ["--state-file", join(root, "fake-state.json"), "--call-log", join(root, "calls.log"), "--durable-turn-ids", "--hold-first-durable-turn", "--terminal-result-file", reportPath, "--replay-terminal-result-on-resume"],
     stateDirectory: root,
     prpIdentity: { runnerInstanceId: "runner-restart", environmentLeaseId: "lease-restart", runId: identity.runId, normalizedSessionId: identity.sessionId, turnId: "turn-restart", itemId: "item-restart" },
   };
@@ -86,6 +86,9 @@ it.each(["none", "before-start", "after-start"] as const)("completes after the r
         async checkpointSession(snapshot) {
           if (failCheckpoint && crash === "after-start" && snapshot.dispositionOnlyRecoveryTurnId === "provider-turn-2") {
             failCheckpoint = false;
+            // Model abrupt controller loss before its cleanup can send Stop to
+            // the live provider and reject the pending completion report.
+            await restored!.detachControllerForRestart();
             throw interruptedController;
           }
           checkpoints.push(structuredClone(snapshot));

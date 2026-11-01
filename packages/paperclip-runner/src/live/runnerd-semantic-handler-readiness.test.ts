@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, it, vi } from "vitest";
@@ -6,7 +6,7 @@ import type { DurablePrpControlPlane } from "../control-plane/durable-prp-contro
 import type { CodexRpcServerRequest } from "../drivers/codex/app-server-transport.js";
 import { createCapabilityRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "./runnerd-codex-transport.js";
 
-it.each(["install", "close", "detach"] as const)("holds an authenticated semantic call until handler readiness or %s", async mode => {
+it.each(["install", "close", "detach", "detach-after-dispatch"] as const)("holds an authenticated semantic call until handler readiness or %s", async mode => {
   const root = await mkdtemp(join(tmpdir(), "runner-handler-readiness-"));
   let core!: DurablePrpControlPlane;
   const bundle = createCapabilityRunnerdCodexTransport({
@@ -20,10 +20,17 @@ it.each(["install", "close", "detach"] as const)("holds an authenticated semanti
       return { release: () => undefined };
     },
   });
-  const handler = vi.fn(async (_request: CodexRpcServerRequest) => ({ success: true, contentItems: [{ type: "inputText", text: "one retained result" }] }));
+  const outcome = { success: true, contentItems: [{ type: "inputText", text: "one retained result" }] };
+  let releaseOutcome!: () => void;
+  const pendingOutcome = new Promise<void>(resolve => { releaseOutcome = resolve; });
+  const handler = vi.fn(async (_request: CodexRpcServerRequest) => {
+    if (mode === "detach-after-dispatch") await pendingOutcome;
+    return outcome;
+  });
   let pid: number | null = null;
   try {
     await bundle.transport.request("thread/start", { cwd: root, dynamicTools: [{ name: "get_task_context", description: "Read the task.", inputSchema: { type: "object", properties: {}, additionalProperties: false } }] });
+    if (mode === "detach-after-dispatch") bundle.transport.setServerRequestHandler(handler);
     await bundle.transport.request("turn/start", { input: [{ type: "text", text: "Read the task." }] });
     pid = bundle.evidence().runnerPid;
     expect(bundle.evidence().runnerProcessGroupId).toBe(pid);
@@ -35,7 +42,14 @@ it.each(["install", "close", "detach"] as const)("holds an authenticated semanti
     expect(core.store.state.commands.filter(command => command.type === "semantic_tool.result")).toHaveLength(0);
     expect(core.semanticToolResultsSettled()).toBe(false);
     if (mode === "close") await bundle.transport.close();
-    if (mode === "detach") await bundle.detachControllerForRestart();
+    if (mode === "detach-after-dispatch") await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+    if (mode.startsWith("detach")) {
+      const detached = bundle.detachControllerForRestart();
+      await expect(bundle.transport.request("turn/start", { input: [{ type: "text", text: "Do not admit replacement work." }] })).rejects.toThrow("transport is closed");
+      await detached;
+    }
+    const retiredJournal = mode.startsWith("detach") ? await readFile(join(root, "control-plane/control-plane-state.json"), "utf8") : null;
+    releaseOutcome();
     bundle.transport.setServerRequestHandler(handler);
     if (mode === "install") {
       await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
@@ -44,7 +58,12 @@ it.each(["install", "close", "detach"] as const)("holds an authenticated semanti
       expect(handler.mock.calls[0]?.[0]).toMatchObject({ method: "item/tool/call", params: { tool: "get_task_context" } });
     } else {
       await new Promise(resolveWait => setTimeout(resolveWait, 50));
-      expect(handler).not.toHaveBeenCalled();
+      if (mode === "detach-after-dispatch") expect(handler).toHaveBeenCalledOnce();
+      else expect(handler).not.toHaveBeenCalled();
+      if (mode.startsWith("detach")) {
+        expect(await readFile(join(root, "control-plane/control-plane-state.json"), "utf8")).toBe(retiredJournal);
+        expect(core.store.state.commands.filter(command => command.type === "semantic_tool.result")).toHaveLength(0);
+      }
     }
   } finally {
     await bundle.transport.close().catch(() => undefined);

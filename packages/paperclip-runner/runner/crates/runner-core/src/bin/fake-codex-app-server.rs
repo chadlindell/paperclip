@@ -1356,6 +1356,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))?;
                     }
                 }
+                if args.iter().any(|arg| arg == "--replay-terminal-result-on-resume") {
+                    if let (Some(turn_id), Some(result)) = (state.active_turn_id.as_deref(), terminal_result.as_ref()) {
+                        if !(hold_first_durable_turn && state.next_turn == 1) {
+                            send(json!({"id": "terminal-result-request", "method": "item/tool/call",
+                                "params": {"threadId": state.thread_id, "turnId": turn_id,
+                                    "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result}}))?;
+                        }
+                    }
+                }
             }
             "thread/turns/list" => {
                 if args
