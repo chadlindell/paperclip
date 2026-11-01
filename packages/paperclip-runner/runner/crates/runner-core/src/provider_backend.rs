@@ -5773,6 +5773,40 @@ mod tests {
     }
 
     #[test]
+    fn unreported_commentary_after_listing_cannot_satisfy_the_task_contract() {
+        let mut state = declared_finish_state();
+        let commands = normalize_provider_notification(&mut state, "item/completed", &json!({
+            "threadId": "thread-1", "turnId": "turn-1", "item": {
+                "id": "listing", "type": "commandExecution", "command": "ls -la",
+                "cwd": "/synthetic/workspace", "status": "completed", "exitCode": 0,
+                "aggregatedOutput": "contract.json\nqualification_task.py\n"
+            }
+        })).unwrap();
+        assert!(commands.iter().any(|event| event.event_type == "tool.execution.completed"));
+        state.last_agent_message = Some("I need to run the specified fixture command `python3 qualification_task.py productive` as instructed. Let me first check what this script contains to understand what it does.".to_owned());
+        assert!(state.active_provider_result_fingerprint.is_none());
+        let events = terminal_events(&state, "turn.completed", None);
+        assert!(events.iter().all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events.iter().all(|event| event.payload["reportedWorkDisposition"] != "done"));
+    }
+
+    #[test]
+    fn unreported_provider_goal_completion_cannot_satisfy_the_task_contract() {
+        let state = declared_finish_state();
+        let events = terminal_events(&state, "turn.completed", Some("complete"));
+        assert!(events.iter().all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events.iter().all(|event| event.payload["reportedWorkDisposition"] != "done"));
+    }
+
+    #[test]
+    fn unreported_empty_turn_cannot_satisfy_the_task_contract() {
+        let state = declared_finish_state();
+        let events = terminal_events(&state, "turn.completed", None);
+        assert!(events.iter().all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events.iter().all(|event| event.payload["reportedWorkDisposition"] != "done"));
+    }
+
+    #[test]
     fn ordinary_final_message_without_a_finish_attempt_keeps_its_fallback() {
         let mut state = declared_finish_state();
         state.last_agent_message = Some("The requested answer is ready.".to_owned());
