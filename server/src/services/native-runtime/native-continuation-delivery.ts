@@ -14,15 +14,17 @@ export async function hasDeferredNativeWakeStop(db: Db,
   const intentId = context?.nativeStatusWakeIntentId;
   if (typeof intentId !== "string" || !isUuidLike(intentId) || wake.requestedByActorType !== "system" ||
       wake.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return false;
-  const [intent] = await db.select({ requestedAt: agentWakeupRequests.requestedAt }).from(agentWakeupRequests).where(and(
+  const [intent] = await db.select({ requestedAt: sql<string>`${agentWakeupRequests.requestedAt}::text` }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
     eq(agentWakeupRequests.source, "automation"), eq(agentWakeupRequests.requestedByActorType, "system"),
     eq(agentWakeupRequests.requestedByActorId, "native-status-committer"), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
   )).limit(1);
-  const requestedAt = intent?.requestedAt ?? wake.requestedAt;
+  // Preserve PostgreSQL precision: rounding a post-Stop intent down to its
+  // millisecond can incorrectly hold its entire coalesced delivery.
+  const requestedAt = intent?.requestedAt ?? wake.requestedAt.toISOString();
   const stopped = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId), eq(heartbeatRuns.status, "cancelled"),
-    eq(boundRunIssueIdSql(), issueId), sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) >= ${requestedAt.toISOString()}::timestamptz`,
+    eq(boundRunIssueIdSql(), issueId), sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) >= ${requestedAt}::timestamptz`,
     or(eq(heartbeatRuns.runtimeMode, "native"), sql`not exists (select 1 from ${agentWakeupRequests} interrupt
       where interrupt.company_id = ${wake.companyId} and interrupt.agent_id = ${wake.agentId}
         and interrupt.id::text = ${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId'

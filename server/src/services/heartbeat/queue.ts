@@ -1,3 +1,4 @@
+import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 import { boundRunIssueIdSql } from "../run-task-binding.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
@@ -5064,10 +5065,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // between two intents created within the same millisecond.
             const [boundary] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, candidate.companyId), eq(heartbeatRuns.agentId, candidate.agentId),
-              eq(boundRunIssueIdSql(), issueId!), eq(heartbeatRuns.status, "cancelled"),
-              or(isNull(heartbeatRuns.finishedAt), and(
+              eq(boundRunIssueIdSql(), issueId!),
+              or(and(eq(heartbeatRuns.status, "cancelled"), or(isNull(heartbeatRuns.finishedAt), and(
                 sql`${heartbeatRuns.finishedAt} >= least(${intents[0]!.requestedAt}::timestamptz, ${intents[1]!.requestedAt}::timestamptz)`,
                 sql`${heartbeatRuns.finishedAt} < greatest(${intents[0]!.requestedAt}::timestamptz, ${intents[1]!.requestedAt}::timestamptz)`,
+              ))), and(
+                // Stop records this fence before its terminal CAS. That CAS
+                // may already have captured a cutoff before this issue lock.
+                or(inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+                  pendingFailedNativeRetryCancellationCondition()),
+                or(sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`,
+                  sql`nullif(${heartbeatRuns.resultJson}->'startupCancellation'->>'requestedAt', '') is not null`),
               )),
             )).limit(1);
             if (boundary) return false;
