@@ -170,7 +170,7 @@ describe("native status continuation behind outgoing ownership", () => {
     const worker = await start();
     const [saved] = await dispatches(f);
     expect(saved).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopped!.finishedAt!.getTime());
+    expect(saved.requestedAt.getTime()).toBeGreaterThan(stopFinishedAt.getTime());
     await worker.stop();
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
@@ -178,14 +178,25 @@ describe("native status continuation behind outgoing ownership", () => {
     expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
   });
 
-  it.each(["acknowledged", "late_acknowledged", "none", "submillisecond"])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stopMode => {
+  it.each(["acknowledged", "late_acknowledged", "none", "submillisecond", "pending_execution", "pending_startup", "pending_native_retry"])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stopMode => {
     const f = await fixture();
     const separatesStop = stopMode !== "none" && stopMode !== "submillisecond";
+    const pendingCommit = stopMode.startsWith("pending_");
+    const stopFinishedAt = new Date();
     const [stopped] = stopMode !== "none" ? await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
-      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
-      resultJson: { executionCancellation: { state: stopMode === "late_acknowledged" ? "requested" : "acknowledged" },
+      status: stopMode === "pending_native_retry" ? "failed" : pendingCommit ? "running" : "cancelled",
+      runtimeMode: stopMode === "pending_native_retry" ? "native" : "legacy",
+      nativeIssueId: stopMode === "pending_native_retry" ? f.issueId : null,
+      startedAt: new Date(), finishedAt: pendingCommit ? null : stopFinishedAt, contextSnapshot: { issueId: f.issueId },
+      resultJson: {
+        ...(stopMode === "pending_startup" || stopMode === "pending_native_retry"
+          ? { startupCancellation: { requestedAt: stopFinishedAt.toISOString() } }
+          : { executionCancellation: { state: pendingCommit || stopMode === "late_acknowledged" ? "requested" : "acknowledged" } }),
         cancellation: { source: "operator", reason: "Stopped by operator", expected: true } },
     }).returning() : [];
+    if (stopMode === "pending_native_retry") await db.insert(nativeRunFinalizations).values({
+      runId: stopped!.id, companyId: f.companyId, issueId: f.issueId, phase: "retryable_failure",
+    });
     // A later explicitly resumed run produces a distinct real committer intent.
     // Leave both outbox entries undispatched to exercise one delivery batch.
     const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
@@ -224,7 +235,7 @@ describe("native status continuation behind outgoing ownership", () => {
     }
     expect(fresh.intentId).not.toBe(f.intentId);
     const [freshIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, fresh.intentId));
-    if (separatesStop) expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopped!.finishedAt!.getTime());
+    if (separatesStop) expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopFinishedAt.getTime());
     await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     const [oldSaved] = await dispatches(f);
     expect(oldSaved).toMatchObject({ status: "deferred_issue_execution", runId: null });
@@ -232,6 +243,12 @@ describe("native status continuation behind outgoing ownership", () => {
     if (separatesStop) expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
       payload: { _paperclipWakeContext: { nativeStatusWakeIntentId: fresh.intentId } } });
     if (separatesStop) expect(freshSaved.id).not.toBe(oldSaved.id);
+    // The cancellation finalizer can capture its cutoff before taking the
+    // issue lock, then publish it after the coalescing transaction.
+    if (stopped && pendingCommit) await db.update(heartbeatRuns).set({
+      status: "cancelled", finishedAt: stopFinishedAt,
+      resultJson: { ...stopped.resultJson, executionCancellation: { state: "acknowledged" } }, updatedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, stopped.id));
     // Remote termination can acknowledge an already-cancelled run later,
     // preserving its original finishedAt outside the issue lock.
     if (stopped && stopMode === "late_acknowledged") await db.update(heartbeatRuns).set({
