@@ -6083,9 +6083,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#controlPlaneCheckpoint = registration.checkpoint ?? null;
       this.#controlPlaneRelease =
         oldTransitionRegistration && newTransitionRegistration
-          ? async () => {
+          ? async (reason) => {
               const releases = await Promise.allSettled([oldTransitionRegistration!, newTransitionRegistration!]
-                .map(entry => Promise.resolve().then(() => entry.release())));
+                .map(entry => Promise.resolve().then(() => entry.release(reason))));
               const failures = releases.flatMap(result => result.status === "rejected" ? [result.reason] : []);
               if (failures.length > 0) {
                 this.#controllerCleanupFailure ??= failures[0] instanceof Error ? failures[0] : new Error(String(failures[0]));
