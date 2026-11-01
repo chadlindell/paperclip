@@ -430,7 +430,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe("cancelled");
   });
 
-  it("retires the receipt when a later run of the agent already started on the task", async () => {
+  it("does not treat another completed run as proof the handoff was delivered", async () => {
     const f = await seed();
     const { heartbeat, parked } = await parkWake(f);
     const [started] = await db.insert(heartbeatRuns).values({
@@ -439,8 +439,11 @@ const support = await getEmbeddedPostgresTestSupport();
     }).returning();
     await releaseLease(f);
     await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
-    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "cancelled", runId: null });
-    expect(await nextAgentIssueRuns(f)).toEqual([expect.objectContaining({ id: started!.id })]);
+    const runs = await nextAgentIssueRuns(f);
+    expect(runs).toHaveLength(2);
+    const successor = runs.find(run => run.id !== started!.id)!;
+    expect(successor.contextSnapshot?.executionStage).toEqual(f.wake.payload.executionStage);
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: successor.id });
   });
 
   it("waits behind a queued run of the agent that has not started yet", async () => {

@@ -879,14 +879,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       if (!executionOwnershipWaitAppliesToIssue(current.payload, issue, current.agentId)) {
         return retire("Deferred execution wake no longer applies to the task owner or stage");
       }
-      const laterRuns = await tx.select({ startedAt: heartbeatRuns.startedAt, status: heartbeatRuns.status })
+      const laterRuns = await tx.select({ id: heartbeatRuns.id })
         .from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, current.companyId), eq(heartbeatRuns.agentId, current.agentId),
           or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, eq(heartbeatRuns.nativeIssueId, issueId)),
           gt(heartbeatRuns.createdAt, current.requestedAt),
-        ));
-      if (laterRuns.some(run => run.startedAt)) return retire("A later run of this agent superseded the deferred execution wake");
-      if (laterRuns.some(run => ["queued", "scheduled_retry"].includes(run.status))) return null;
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        )).limit(1);
+      if (laterRuns.length) return null;
       if (!["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return null;
       if (await getExecutionBlocker(tx as unknown as Db, current.companyId, issueId)) {
         await tx.update(agentWakeupRequests).set({ updatedAt: now }).where(eq(agentWakeupRequests.id, current.id));
