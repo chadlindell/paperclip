@@ -210,6 +210,11 @@ turn terminal and a failed `run.terminal`. It emits no `run.result.proposed`;
 provider text and transport completion cannot satisfy the task contract. Core's
 existing permanent failure path retains a visible recovery owner and clears
 the completed execution's task ownership instead of marking the issue done.
+If a goal becomes complete after an active turn has already ended, Core also
+requires an accepted semantic report; a late goal update alone raises the same
+typed `semantic_completion_missing` failure. An accepted report retains its
+disposition and evidence when the provider goal subsequently pauses, blocks, or
+reaches a usage limit. Goal lifecycle metadata cannot rewrite that report.
 
 Before interrupting a Codex turn, the runner durably records a
 `harness.diagnostic` event with code `provider_interrupt_requested`, the stop
