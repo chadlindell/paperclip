@@ -26,11 +26,12 @@ describe("native status continuation behind outgoing ownership", () => {
 
   async function fixture() {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
-    const contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
+    const contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID(), previousAgentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Native handoff", defaultResponsibleUserId: "board" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", status: "idle", adapterType: "process",
       adapterConfig: { command: process.execPath, args: ["-e", "throw Error('provider must not launch')"] },
       runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(agents).values({ id: previousAgentId, companyId, name: "Outgoing owner", status: "idle", adapterType: "opencode_local" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Native continuation", status: "in_progress", assigneeAgentId: agentId });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, runtimeMode: "native", nativeIssueId: issueId,
       status: "succeeded", startedAt: new Date(Date.now() - 120_000), finishedAt: new Date(Date.now() - 60_000),
@@ -55,7 +56,7 @@ describe("native status continuation behind outgoing ownership", () => {
           agentId, idempotencyKey: `continuation:${issueId}` }] } });
     const [effect] = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id));
     expect(effect).toMatchObject({ effectKind: "enqueue_continuation", deliveryState: "delivered" });
-    const [outgoing] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "cancelled", runtimeMode: "legacy",
+    const [outgoing] = await db.insert(heartbeatRuns).values({ companyId, agentId: previousAgentId, status: "cancelled", runtimeMode: "legacy",
       startedAt: new Date(Date.now() - 30_000), finishedAt: new Date(), errorCode: "issue_reassigned",
       contextSnapshot: { issueId }, resultJson: { conversationContinuation: "continue_conversation_v1",
         executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() },
@@ -81,7 +82,7 @@ describe("native status continuation behind outgoing ownership", () => {
     eq(heartbeatRuns.companyId, f.companyId), ne(heartbeatRuns.id, f.runId), ne(heartbeatRuns.id, f.outgoing.id), ne(heartbeatRuns.id, f.busy.id),
   ));
 
-  it("resumes the committed native decision receipt after out-of-band lease release without another wake", async () => {
+  it.each(["restart", "held", "concurrent", "paused"])("resumes the committed native decision receipt after out-of-band lease release without another wake (%s)", async mode => {
     const f = await fixture();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ cause: "execution_owner_active" });
     const worker = await start();
@@ -90,10 +91,28 @@ describe("native status continuation behind outgoing ownership", () => {
       payload: { executionWait: { cause: "execution_owner_active" }, _paperclipWakeContext: { nativeStatusWakeIntentId: f.intentId } } });
     expect(await successors(f)).toHaveLength(0);
     await worker.stop();
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    if (mode === "held") {
+      const held = await start();
+      expect(await successors(f)).toHaveLength(0);
+      expect(held.nextWakeAt()).not.toBeNull();
+      expect((await dispatches(f))[0]).toMatchObject({ id: saved.id, status: "deferred_issue_execution", runId: null });
+      await held.stop();
+    }
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
       .where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
-    await start();
+    if (mode === "paused") {
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+      const paused = await start();
+      expect(await successors(f)).toHaveLength(0);
+      expect((await dispatches(f))[0]).toMatchObject({ id: saved.id, status: "deferred_issue_execution", runId: null });
+      await paused.stop();
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
+    }
+    if (mode === "concurrent") await Promise.all([start(), start()]);
+    else await start();
     expect(await successors(f)).toHaveLength(1);
     expect(await dispatches(f)).toHaveLength(1);
     const [delivered] = await dispatches(f);
