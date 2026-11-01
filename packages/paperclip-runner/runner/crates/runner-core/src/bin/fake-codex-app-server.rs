@@ -1179,7 +1179,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }))?;
             } else if !hold_turn {
-                finish_turn(&state_path, &mut state, "completed")?;
+                if let Some(result) = &terminal_result {
+                    send(json!({ "id": "terminal-result-request", "method": "item/tool/call",
+                        "params": { "threadId": state.thread_id, "turnId": state.active_turn_id,
+                            "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result } }))?;
+                } else {
+                    finish_turn(&state_path, &mut state, "completed")?;
+                }
             }
             continue;
         }
@@ -1861,7 +1867,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "version":1,"supersedeOnUserComment":false}
                         }}),
                     )?;
-                } else if let Some(result) = &terminal_result {
+                } else if let Some(result) = terminal_result.as_ref().filter(|_| !emit_tool_call) {
                     send(json!({
                         "id": "terminal-result-request", "method": "item/tool/call",
                         "params": { "threadId": state.thread_id, "turnId": provider_turn_id,
