@@ -98,9 +98,10 @@ async function registeredFixture(releaseRoute: () => Promise<void>, registration
     controlPlaneRegistration: async authority => {
       core = authority;
       await core.start();
+      const connectUrl = core.connectUrl;
       entered.resolve();
       await registrationGate;
-      return { connectUrl: core.connectUrl, release: releaseRoute };
+      return { connectUrl, release: releaseRoute };
     },
     runnerProcessLauncher: () => { throw new Error("fixture launch stopped"); },
   });
