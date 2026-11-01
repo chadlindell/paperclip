@@ -5846,8 +5846,8 @@ mod tests {
     }
 
     #[test]
-    fn accepted_completion_disposition_survives_provider_goal_completion_and_interrupt() {
-        for disposition in ["done", "needs_review", "yielded"] {
+    fn accepted_completion_disposition_survives_inactive_goals_and_interrupts() {
+        for disposition in ["done", "needs_review", "yielded", "blocked"] {
             let mut state = declared_finish_state();
             let mut result = valid_opencode_result();
             result["reportedWorkDisposition"] = json!(disposition);
@@ -5860,13 +5860,37 @@ mod tests {
                     "kind": "response_wake", "summary": "Wait for the response.", "idempotencyKey": "response-1"
                 });
             }
-            admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
-            for goal in [None, Some("complete")] {
-                let events = terminal_events(&state, "turn.interrupted", goal);
-                assert_eq!(events.len(), 1);
-                assert_eq!(events[0].event_type, "run.terminal");
-                assert_eq!(events[0].payload["reportedWorkDisposition"], disposition);
-                assert_eq!(events[0].payload["runTerminalState"], "succeeded");
+            let tool_name = if disposition == "blocked" {
+                result["completionClaim"]["objectiveSatisfied"] = json!(false);
+                result["completionClaim"]["criteria"][0]["status"] = json!("unknown");
+                result["completionClaim"]["criteria"][0]["evidenceRefs"] = json!([]);
+                result["completionClaim"]["remainingWork"] = json!([{
+                    "description": "Restore the unavailable test fixture.", "blocksCompletion": true
+                }]);
+                result["blocker"] = json!({
+                    "reasonCode": "test_fixture_unavailable",
+                    "owner": {"kind": "system", "name": "test fixture"},
+                    "unblockAction": "Restore the test fixture.",
+                    "scope": "task_wide"
+                });
+                "paperclip_block"
+            } else {
+                "paperclip_finish"
+            };
+            admit_terminal_tool_authority(&mut state, tool_name, &result, false).unwrap();
+            for event_type in ["turn.completed", "turn.interrupted", "turn.cancelled"] {
+                assert!(terminal_events(&state, event_type, Some("active")).is_empty());
+                for goal in [
+                    None, Some("complete"), Some("paused"), Some("blocked"),
+                    Some("limited"), Some("usage_limited"), Some("budget_limited"),
+                ] {
+                    let events = terminal_events(&state, event_type, goal);
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].event_type, "run.terminal");
+                    assert_eq!(events[0].payload["reportedWorkDisposition"], disposition);
+                    assert_eq!(events[0].payload["runTerminalState"], "succeeded",
+                        "accepted {disposition}, {event_type}, goal {goal:?}");
+                }
             }
         }
     }
