@@ -925,6 +925,7 @@ async function consumeTurn(
     let highestContiguousSourceSeq = 0;
     let governedResult: PrpStructuredRunResult | null = null;
     let semanticResultProposal: PrpStructuredRunResult | null = null;
+    let semanticResultTurnId: string | null = null;
     let sessionGoalObserved = sessionGoal !== undefined;
     let previousGoal = initialGoal ?? null;
     let goalControlObserved = false;
@@ -1056,6 +1057,19 @@ async function consumeTurn(
         highestContiguousSourceSeq,
         receipt.highestContiguousSourceSeq,
       );
+      // NativeSession events carry the normalized provider turn identity.
+      // A new turn revokes the preceding turn's completion authority, just as
+      // the provider driver does. Preserve duplicate/replayed starts only when
+      // both events prove the same turn; an absent identity cannot prove reuse.
+      if (event.eventType === "turn.started" && semanticResultProposal !== null &&
+          (!event.turnId || event.turnId !== semanticResultTurnId)) {
+        semanticResultProposal = null;
+        semanticResultTurnId = null;
+        if (resultSource === "semantic_result") {
+          governedResult = null;
+          resultSource = null;
+        }
+      }
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
@@ -1082,7 +1096,10 @@ async function consumeTurn(
       }
       if (event.eventType === "run.result.proposed") {
         const validation = validatePrpStructuredRunResult(event.payload);
-        if (validation.ok) semanticResultProposal = validation.result;
+        if (validation.ok) {
+          semanticResultProposal = validation.result;
+          semanticResultTurnId = event.turnId ?? null;
+        }
       }
       if (event.eventType === "session.failed") {
         const failure = payload.error && typeof payload.error === "object"
