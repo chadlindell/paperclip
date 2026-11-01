@@ -5040,7 +5040,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const priorDelivery = scopeKey
         ? deliveredByIssueScope.get(scopeKey)
         : null;
-      if (priorDelivery) {
+      // A parked receipt has its own intent timestamp and Stop authority.
+      // It cannot acknowledge another decision's work before a run exists:
+      // the earlier receipt may remain held while the newer intent is eligible.
+      if (priorDelivery?.runId) {
         await db.transaction(async tx => {
           await notifyChatRunMilestones(tx, { companyId: candidate.companyId, issueId: issueId ?? undefined });
           await tx
