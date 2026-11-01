@@ -167,8 +167,11 @@ describe("native status continuation behind outgoing ownership", () => {
       priorDecisionId: issue.lastStatusDecisionId, supersedesCommittedDecisionId: f.decisionId,
       decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
         reasonCode: "live_continuation_registered", unblockDescriptor: null,
-        effects: [{ kind: "notify_owner", agentId: current.id, reason: "issue_children_completed" }] } });
+        effects: [{ kind: "enqueue_continuation", continuationKind: "same_agent", agentId: current.id,
+          summary: "Continue as current owner", idempotencyKey: `current-owner:${f.issueId}` }] } });
     const parked = await start();
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.agentId, current.id), eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(1);
     await parked.stop();
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.companyId, f.companyId));
