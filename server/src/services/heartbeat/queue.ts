@@ -1,3 +1,4 @@
+import { boundRunIssueIdSql } from "../run-task-binding.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
@@ -4912,7 +4913,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     onDeferredDeadline?: (at: number) => void;
     onError?: (error: unknown) => void;
   };
-  type NativeStatusWakeDelivery = { runId: string | null; status: string };
+  type NativeStatusWakeDelivery = { intentId: string; runId: string | null; status: string };
 
   function createNativeStatusWakeBatch() {
     const deliveredByIssueScope = new Map<string, NativeStatusWakeDelivery>();
@@ -5040,11 +5041,37 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const priorDelivery = scopeKey
         ? deliveredByIssueScope.get(scopeKey)
         : null;
-      // A parked receipt has its own intent timestamp and Stop authority.
-      // It cannot acknowledge another decision's work before a run exists:
-      // the earlier receipt may remain held while the newer intent is eligible.
-      if (priorDelivery?.runId) {
-        await db.transaction(async tx => {
+      if (priorDelivery) {
+        const coalesced = await db.transaction(async tx => {
+          if (!priorDelivery.runId) {
+            // A cancellation separates causal authority even before its Stop
+            // acknowledgement arrives. Keep both receipts across that boundary;
+            // otherwise ordinary parked intents still share one future turn.
+            const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.companyId, candidate.companyId), eq(issues.id, issueId!),
+            )).for("update");
+            if (!issue) return false;
+            const intents = await tx.select({ requestedAt: sql<string>`${agentWakeupRequests.requestedAt}::text` })
+              .from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, candidate.companyId), eq(agentWakeupRequests.agentId, candidate.agentId),
+                inArray(agentWakeupRequests.id, [priorDelivery.intentId, candidate.id]),
+                eq(agentWakeupRequests.requestedByActorType, "system"),
+                eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+              ));
+            if (intents.length !== 2) return false;
+            // Keep PostgreSQL precision; a Date round trip can erase a Stop
+            // between two intents created within the same millisecond.
+            const [boundary] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, candidate.companyId), eq(heartbeatRuns.agentId, candidate.agentId),
+              eq(boundRunIssueIdSql(), issueId!), eq(heartbeatRuns.status, "cancelled"),
+              or(isNull(heartbeatRuns.finishedAt), and(
+                sql`${heartbeatRuns.finishedAt} >= least(${intents[0]!.requestedAt}::timestamptz, ${intents[1]!.requestedAt}::timestamptz)`,
+                sql`${heartbeatRuns.finishedAt} < greatest(${intents[0]!.requestedAt}::timestamptz, ${intents[1]!.requestedAt}::timestamptz)`,
+              )),
+            )).limit(1);
+            if (boundary) return false;
+          }
           await notifyChatRunMilestones(tx, { companyId: candidate.companyId, issueId: issueId ?? undefined });
           await tx
             .update(agentWakeupRequests)
@@ -5056,9 +5083,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               updatedAt: new Date(),
             })
             .where(eq(agentWakeupRequests.id, candidate.id));
+          return true;
         });
-        recovered += 1;
-        continue;
+        if (coalesced) {
+          recovered += 1;
+          continue;
+        }
       }
 
       let completedOnboardingGuard: WakeupOptions["issueStateGuard"];
@@ -5179,6 +5209,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
         if (scopeKey) {
           deliveredByIssueScope.set(scopeKey, {
+            intentId: candidate.id,
             runId: wakeRun?.id ?? delivered?.runId ?? null,
             status: wakeRun ? "coalesced" : (delivered?.status ?? "queued"),
           });

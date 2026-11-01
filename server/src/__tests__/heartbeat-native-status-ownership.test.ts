@@ -178,11 +178,11 @@ describe("native status continuation behind outgoing ownership", () => {
     expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
   });
 
-  it.each([true, false])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stoppedByOperator => {
+  it.each(["acknowledged", "late_acknowledged", "none"])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stopMode => {
     const f = await fixture();
-    const [stopped] = stoppedByOperator ? await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+    const [stopped] = stopMode !== "none" ? await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
-      resultJson: { executionCancellation: { state: "acknowledged" },
+      resultJson: { executionCancellation: { state: stopMode === "late_acknowledged" ? "requested" : "acknowledged" },
         cancellation: { source: "operator", reason: "Stopped by operator", expected: true } },
     }).returning() : [];
     // A later explicitly resumed run produces a distinct real committer intent.
@@ -220,6 +220,11 @@ describe("native status continuation behind outgoing ownership", () => {
     if (stopped) expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
       payload: { _paperclipWakeContext: { nativeStatusWakeIntentId: fresh.intentId } } });
     if (stopped) expect(freshSaved.id).not.toBe(oldSaved.id);
+    // Remote termination can acknowledge an already-cancelled run later,
+    // preserving its original finishedAt outside the issue lock.
+    if (stopped && stopMode === "late_acknowledged") await db.update(heartbeatRuns).set({
+      resultJson: { ...stopped.resultJson, executionCancellation: { state: "acknowledged" } }, updatedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, stopped.id));
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
       .where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
