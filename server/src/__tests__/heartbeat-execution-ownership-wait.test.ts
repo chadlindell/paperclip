@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { and, asc, eq, ne, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -449,6 +450,23 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "cancelled" });
     expect(await nextAgentIssueRuns(f)).toHaveLength(0);
   });
+
+  it.each(["company", "agent", "backlog"] as const)("retains the handoff behind a current %s hold", async hold => {
+    const f = await seed({ stage: false });
+    const { heartbeat, parked } = await parkWake(f);
+    await releaseLease(f);
+    if (hold === "company") await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId));
+    if (hold === "agent") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.nextAgentId));
+    if (hold === "backlog") await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issueId));
+    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
+    expect(await nextAgentIssueRuns(f)).toHaveLength(0);
+    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe("deferred_issue_execution");
+    if (hold === "company") await db.update(companies).set({ status: "active" }).where(eq(companies.id, f.companyId));
+    if (hold === "agent") await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.nextAgentId));
+    if (hold === "backlog") await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
+    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+  });
   describe("shared ownership-wait worker", () => {
     const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
     let calls: number;
@@ -478,7 +496,9 @@ const support = await getEmbeddedPostgresTestSupport();
     }
     async function settle() {
       await vi.advanceTimersByTimeAsync(30_000);
-      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0), { timeout: 5000 });
+      const deadline = performance.now() + 5000;
+      while (idleWorkSnapshot().active && performance.now() < deadline) await delay(20);
+      expect(idleWorkSnapshot().active).toBe(0);
       expect(errors).toEqual([]);
     }
     async function quiet(c: Awaited<ReturnType<typeof start>>) {
