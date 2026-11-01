@@ -600,6 +600,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
   describe("shared ownership-wait worker", () => {
     const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
+    const passes = new Set<Promise<unknown>>();
     let calls: number;
     let observed: typeof db;
     let draining: boolean;
@@ -621,6 +622,13 @@ const support = await getEmbeddedPostgresTestSupport();
       const heartbeat = heartbeatService(observed);
       const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining,
         canReconcile: () => true, onError: error => { errors.push(error); } });
+      const register = c.register.bind(c);
+      c.register = (queue, task) => register(queue, { ...task, run: signal => {
+        const pass = Promise.resolve(task.run(signal));
+        passes.add(pass);
+        void pass.then(() => passes.delete(pass), () => passes.delete(pass));
+        return pass;
+      } });
       coordinators.push(c);
       await heartbeat.registerDeferredReceiptWork(c, () => !draining).ready;
       return c;
@@ -629,7 +637,8 @@ const support = await getEmbeddedPostgresTestSupport();
       await vi.advanceTimersByTimeAsync(30_000);
       const deadline = performance.now() + 5000;
       while (idleWorkSnapshot().active && performance.now() < deadline) await delay(20);
-      expect(idleWorkSnapshot().active).toBe(0);
+      expect(idleWorkSnapshot().active, JSON.stringify({ passes: passes.size,
+        now: Date.now(), next: coordinators.map(c => c.nextWakeAt()) })).toBe(0);
       expect(errors).toEqual([]);
     }
     async function quiet(c: Awaited<ReturnType<typeof start>>) {
