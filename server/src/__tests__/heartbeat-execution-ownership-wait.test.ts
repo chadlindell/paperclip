@@ -13,6 +13,8 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
+import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
 import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
 import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 
@@ -601,13 +603,14 @@ const support = await getEmbeddedPostgresTestSupport();
   describe("shared ownership-wait worker", () => {
     const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
     const passes = new Set<Promise<unknown>>();
+    let nextPassHooks: { before(): Promise<void>; after(): Promise<void> } | undefined;
     let calls: number;
     let observed: typeof db;
     let draining: boolean;
     const errors: unknown[] = [];
     beforeEach(async () => {
       await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
-      calls = 0; draining = false; errors.length = 0;
+      calls = 0; draining = false; errors.length = 0; nextPassHooks = undefined;
       observed = new Proxy(db, { get(target, key) {
         if (!["select", "update", "insert", "delete", "execute", "transaction"].includes(String(key))) return Reflect.get(target, key);
         return (...args: unknown[]) => { calls++; return Reflect.apply(Reflect.get(target, key), target, args); };
@@ -624,7 +627,9 @@ const support = await getEmbeddedPostgresTestSupport();
         canReconcile: () => true, onError: error => { errors.push(error); } });
       const register = c.register.bind(c);
       c.register = (queue, task) => register(queue, { ...task, run: signal => {
-        const pass = Promise.resolve(task.run(signal));
+        const hooks = queue === DELIVERY_QUEUES.deferredExecutionReceipts ? nextPassHooks : undefined;
+        if (hooks) nextPassHooks = undefined;
+        const pass = (async () => { await hooks?.before(); await task.run(signal); await hooks?.after(); })();
         passes.add(pass);
         void pass.then(() => passes.delete(pass), () => passes.delete(pass));
         return pass;
@@ -672,6 +677,24 @@ const support = await getEmbeddedPostgresTestSupport();
       const workers = await Promise.all([start(), start()]);
       expect(await nextAgentIssueRuns(f)).toHaveLength(1);
       for (const c of workers) await quiet(c);
+    });
+    it("settles a producer hint arriving after a queue scan completes beyond the first clock step", async () => {
+      const c = await start();
+      await quiet(c);
+      const f = await seed();
+      nextPassHooks = {
+        before: () => new Promise(resolve => setTimeout(resolve, 30_000)),
+        after: () => db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: f.companyId })),
+      };
+      await parkWake(f);
+      await vi.advanceTimersByTimeAsync(1);
+      await settle();
+      expect(nextPassHooks).toBeUndefined();
+      expect(await nextAgentIssueRuns(f)).toHaveLength(0);
+      await releaseLease(f);
+      await settle();
+      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
+      await quiet(c);
     });
     it.each([false, true])("observes nested admission only after outer settlement (rollback=%s)", async rollback => {
       const c = await start();
