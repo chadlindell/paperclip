@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { and, eq, ne, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, agentWakeupRequests, companies, completionContracts, createDb, environmentLeases,
   heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, statusDecisionEffects, workAssessments,
@@ -23,6 +23,7 @@ describe("native status continuation behind outgoing ownership", () => {
     db.$client.options.onnotice = () => {};
     await Promise.all(Array.from({ length: 6 }, () => db.execute(sql`select pg_sleep(0.01)`)));
   }, 90_000);
+  beforeEach(async () => { await db.execute(sql`truncate companies cascade`); });
   afterEach(async () => { for (const worker of workers.splice(0)) await worker.stop(); vi.useRealTimers(); vi.restoreAllMocks(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await temporary?.cleanup(); });
 
@@ -132,7 +133,8 @@ describe("native status continuation behind outgoing ownership", () => {
     await worker.stop();
     const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
-      resultJson: { executionCancellation: { state: "acknowledged" }, cancellation: { source: "board", reason: "Stopped by operator", expected: true } },
+      resultJson: { conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "acknowledged" },
+        cancellation: { source: "control_plane", reason: "Stopped by operator", expected: true } },
     }).returning();
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
@@ -141,7 +143,8 @@ describe("native status continuation behind outgoing ownership", () => {
     await afterStop.stop();
     const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.outgoing.agentId,
       status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
-      resultJson: { executionCancellation: { state: "acknowledged" } },
+      resultJson: { conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "acknowledged" },
+        cancellation: { source: "control_plane", reason: "Other owner stopped", expected: true } },
     }).returning();
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, saved.id));
     await start();
