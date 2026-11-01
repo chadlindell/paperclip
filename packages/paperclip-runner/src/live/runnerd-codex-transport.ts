@@ -4779,6 +4779,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
     try {
       await this.#closeAndSettle();
+      if (this.#attachmentCleanupFailure) throw this.#attachmentCleanupFailure;
     } catch (error) {
       this.#queue.close();
       try { await this.#retireControllerForRecovery(deadline); }
