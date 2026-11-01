@@ -6262,13 +6262,21 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           && newTransitionRegistration && this.options.readRunnerState && Date.now() >= nextPhysicalInspection) {
           nextPhysicalInspection = Date.now() + 250;
           const physical = await this.options.readRunnerState();
+          this.#assertStartupOpen();
           const proof = inspectWarmRunTransition({ controlPlaneState: core.store.state, runnerState: physical,
             expectedNewIdentity: recoveryTarget!, expectedRunnerVersion: runnerArtifact.version, expectedRunnerDigest: runnerArtifact.digest });
           if (proof && recoveryIdentityMatches(proof.runnerIdentity, recoveryTarget!)) {
             // The same participant has consumed the old ACK and now serves
             // the target path. Stop obsolete ingress retries before they can
             // compete with the target's authenticated connection.
-            await oldTransitionRegistration.release(); sourceRouteRetired = true;
+            await Promise.resolve()
+              .then(() => oldTransitionRegistration!.release(this.#controllerDetachedForRestart ? "detach" : undefined))
+              .catch((error: unknown) => {
+                this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+                throw error;
+              });
+            sourceRouteRetired = true;
+            this.#assertStartupOpen();
             if (!targetRecoveryActivated) { await newTransitionRegistration.activate?.(); targetRecoveryActivated = true; }
           }
         }
@@ -6286,7 +6294,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#eventSourceSeq = 0;
       this.#deferredTurnStartEvents = [];
       if (oldTransitionRegistration && newTransitionRegistration) {
-        await oldTransitionRegistration.release();
+        await Promise.resolve()
+          .then(() => oldTransitionRegistration!.release(this.#controllerDetachedForRestart ? "detach" : undefined))
+          .catch((error: unknown) => {
+            this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+            throw error;
+          });
         this.#assertStartupOpen();
         this.#controlPlaneRelease = newTransitionRegistration.release;
         this.#controlPlaneCheckpoint = newTransitionRegistration.checkpoint ?? null;
