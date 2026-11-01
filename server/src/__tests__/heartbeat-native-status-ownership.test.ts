@@ -9,6 +9,7 @@ import {
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { idleWorkSnapshot } from "../services/task-admission.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
@@ -327,9 +328,16 @@ describe("native status continuation behind outgoing ownership", () => {
       await delay(50);
     }
     expect(worker.nextWakeAt()).toBeNull();
-    const reads = vi.spyOn(db, "select");
+    const before = { ...idleWorkSnapshot(), now: Date.now(), next: worker.nextWakeAt() };
+    const samples: unknown[] = [];
+    const originalSelect = db.select.bind(db);
+    const reads = vi.spyOn(db, "select").mockImplementation((fields?: any) => {
+      samples.push({ now: Date.now(), idle: idleWorkSnapshot(), stack: new Error().stack });
+      return originalSelect(fields);
+    });
     await vi.advanceTimersByTimeAsync(90_000);
     await delay(20);
+    console.info("idle-test-pass-evidence", JSON.stringify({ before, after: idleWorkSnapshot(), samples }));
     expect(reads).not.toHaveBeenCalled();
   });
 
