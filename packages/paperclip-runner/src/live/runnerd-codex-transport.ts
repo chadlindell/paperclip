@@ -6579,6 +6579,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     payload: Record<string, unknown>,
     correlationId?: string,
   ): Promise<void> {
+    if (this.#controllerDetachedForRestart) throw new Error("PRP Codex transport is closed");
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
     const commandId = correlationId
@@ -6612,6 +6613,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     deadline?: number,
     abortOnClose = false,
   ): Promise<Record<string, unknown>> {
+    if (this.#controllerDetachedForRestart) throw new Error("PRP Codex transport is closed");
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
     const commandId = `command_lab_${randomUUID().replaceAll("-", "")}`;

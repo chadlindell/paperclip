@@ -44,8 +44,17 @@ it.each(["install", "close", "detach", "detach-after-dispatch"] as const)("holds
     if (mode === "close") await bundle.transport.close();
     if (mode === "detach-after-dispatch") await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
     if (mode.startsWith("detach")) {
+      const drain = core.drainPendingConnectionProcessing.bind(core);
+      let releaseDrain!: () => void;
+      const drainGate = new Promise<void>(resolve => { releaseDrain = resolve; });
+      vi.spyOn(core, "drainPendingConnectionProcessing").mockImplementation(async () => { await drainGate; await drain(); });
+      const commandCount = core.store.state.commands.length;
       const detached = bundle.detachControllerForRestart();
-      await expect(bundle.transport.request("turn/start", { input: [{ type: "text", text: "Do not admit replacement work." }] })).rejects.toThrow("transport is closed");
+      try {
+        await expect(bundle.transport.request("turn/start", { input: [{ type: "text", text: "Do not admit replacement work." }] })).rejects.toThrow("transport is closed");
+        await expect(bundle.transport.request("thread/start", { cwd: root })).rejects.toThrow("transport is closed");
+        expect(core.store.state.commands).toHaveLength(commandCount);
+      } finally { releaseDrain(); }
       await detached;
     }
     const retiredJournal = mode.startsWith("detach") ? await readFile(join(root, "control-plane/control-plane-state.json"), "utf8") : null;
