@@ -87,6 +87,7 @@ it.each(["prior-release", "physical-read"] as const)("does not activate a staged
   let core!: DurablePrpControlPlane;
   let attaching: Promise<void> | undefined, detaching: Promise<void> | undefined;
   let physicalHeld = false;
+  let runnerStderr = "";
   const binary = defaultCapabilityRunnerdBinary(), artifact = readRunnerdArtifactBinding(binary);
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: binary, codexCommand: resolve(import.meta.dirname, "../../runner/target/debug/fake-codex-app-server"),
@@ -129,7 +130,7 @@ it.each(["prior-release", "physical-read"] as const)("does not activate a staged
         }
         if (!stopped) rejectReady(new Error("Owned listener never became ready"));
       };
-      return { connection: { mode: "listen" as const, listenAddress: "127.0.0.1", listenPort: port, listenPath: path },
+      return { connection: { mode: "listen" as const, listenAddress: "0.0.0.0", listenPort: port, listenPath: path },
         activate: () => { routeEvents.push(`${name}:activate`); connections.push(connect()); }, ready: () => ready,
         release: async (reason?: "detach") => {
           routeEvents.push(`${name}:release:${reason ?? "normal"}`);
@@ -139,7 +140,8 @@ it.each(["prior-release", "physical-read"] as const)("does not activate a staged
       };
     },
     runnerProcessLauncher: spec => {
-      const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment, stdio: "ignore" });
+      const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment, stdio: ["ignore", "ignore", "pipe"] });
+      child.stderr.on("data", bytes => { runnerStderr += bytes.toString(); });
       const completion = new Promise<RunnerProcessResult>((done, fail) => {
         child.once("error", fail); child.once("exit", (code, signal) => done({ code, signal, stdout: "", stderr: "" }));
       });
@@ -166,6 +168,8 @@ it.each(["prior-release", "physical-read"] as const)("does not activate a staged
     await new Promise<void>(done => setImmediate(done));
     expect(await readFile(join(root, "control-plane/control-plane-state.json"), "utf8")).toBe(journal);
     expect(routeEvents).toEqual(routes);
+  } catch (error) {
+    throw new Error(`${String(error)}; Runner stderr: ${runnerStderr}`, { cause: error });
   } finally {
     held.release();
     await attaching?.catch(() => undefined);
