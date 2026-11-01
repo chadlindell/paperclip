@@ -3628,7 +3628,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #probeRetirement: Promise<void> | null = null;
   readonly prepareConversationResume?: CodexAppServerTransport["prepareConversationResume"];
   #detachPromise: Promise<void> | null = null;
-  #attachmentCleanupFailure: Error | null = null;
+  #controllerCleanupFailure: Error | null = null;
   #startupOperation: Promise<unknown> | null = null;
   #attachmentOperation: Promise<void> | null = null;
   #startupDrainTimedOut = false;
@@ -4370,7 +4370,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await Promise.resolve()
         .then(() => registration?.release())
         .catch((error: unknown) => {
-          this.#attachmentCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+          this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
         });
       if (activationStarted) {
         // Once the completed handoff is exposed, an activation failure makes
@@ -4380,7 +4380,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           await Promise.resolve()
             .then(() => previousRelease?.())
             .catch((error: unknown) => {
-              this.#attachmentCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+              this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
             });
         }
         this.#failTransport(failure);
@@ -4709,7 +4709,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // Close already owns process settlement. Do not redirect it back to this
       // detach promise or reinterpret a failed close as retirement proof.
       await this.#withinRetirementDeadline(() => closing, deadline, "close drain");
-      if (this.#attachmentCleanupFailure) throw this.#attachmentCleanupFailure;
+      if (this.#controllerCleanupFailure) throw this.#controllerCleanupFailure;
       return;
     }
     if (this.#closed) throw new Error("Controller retirement is unconfirmed");
@@ -4729,7 +4729,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#startupDrainTimedOut = true;
         failures.push(error);
       }
-      if (this.#attachmentCleanupFailure) failures.push(this.#attachmentCleanupFailure);
+      if (this.#controllerCleanupFailure) failures.push(this.#controllerCleanupFailure);
       this.#core?.fenceSemanticToolCallbacks();
       // A timed-out join still owes cleanup, but cleanup success never erases
       // the failed join or grants permission to replace its retained writer.
@@ -4782,7 +4782,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
     try {
       await this.#closeAndSettle();
-      if (this.#attachmentCleanupFailure) throw this.#attachmentCleanupFailure;
+      if (this.#controllerCleanupFailure) throw this.#controllerCleanupFailure;
     } catch (error) {
       this.#queue.close();
       try { await this.#retireControllerForRecovery(deadline); }
@@ -6052,7 +6052,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           throw new Error("native_runner_warm_transition_registered_endpoint_mismatch");
         }
       } catch (error) {
-        await Promise.allSettled([oldTransitionRegistration, newTransitionRegistration].map(entry => Promise.resolve().then(() => entry?.release())));
+        const releases = await Promise.allSettled([oldTransitionRegistration, newTransitionRegistration]
+          .map(entry => Promise.resolve().then(() => entry?.release())));
+        for (const result of releases) {
+          if (result.status === "rejected") {
+            this.#controllerCleanupFailure ??= result.reason instanceof Error ? result.reason : new Error(String(result.reason));
+          }
+        }
         throw error;
       }
     }
@@ -6078,10 +6084,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#controlPlaneRelease =
         oldTransitionRegistration && newTransitionRegistration
           ? async () => {
-              await Promise.all([
-                oldTransitionRegistration!.release(),
-                newTransitionRegistration!.release(),
-              ]);
+              const releases = await Promise.allSettled([oldTransitionRegistration!, newTransitionRegistration!]
+                .map(entry => Promise.resolve().then(() => entry.release())));
+              const failures = releases.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+              if (failures.length > 0) {
+                this.#controllerCleanupFailure ??= failures[0] instanceof Error ? failures[0] : new Error(String(failures[0]));
+              }
+              this.#throwRetirementFailures(failures);
             }
           : registration.release;
     }
