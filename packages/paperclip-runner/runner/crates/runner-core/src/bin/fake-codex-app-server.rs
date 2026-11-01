@@ -1867,7 +1867,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "version":1,"supersedeOnUserComment":false}
                         }}),
                     )?;
-                } else if let Some(result) = terminal_result.as_ref().filter(|_| !emit_tool_call) {
+                } else if let Some(result) = terminal_result.as_ref().filter(|_| !emit_tool_call && !hold_turn) {
                     send(json!({
                         "id": "terminal-result-request", "method": "item/tool/call",
                         "params": { "threadId": state.thread_id, "turnId": provider_turn_id,
