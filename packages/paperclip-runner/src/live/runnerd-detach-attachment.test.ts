@@ -13,13 +13,14 @@ function gate() {
 }
 
 it.each([
-  { mode: "registration", releaseFailure: "none" },
-  { mode: "activation", releaseFailure: "none" },
-  { mode: "activation", releaseFailure: "target" },
-  { mode: "activation", releaseFailure: "prior" },
+  { mode: "registration", releaseFailure: "none", retirement: "detach" },
+  { mode: "activation", releaseFailure: "none", retirement: "detach" },
+  { mode: "activation", releaseFailure: "target", retirement: "detach" },
+  { mode: "activation", releaseFailure: "prior", retirement: "detach" },
+  { mode: "registration", releaseFailure: "target", retirement: "close" },
 ] as const)(
-  "joins an admitted warm attachment and preserves release failures ($mode, $releaseFailure)",
-  async ({ mode, releaseFailure }) => {
+  "joins an admitted warm attachment and preserves release failures ($mode, $releaseFailure, $retirement)",
+  async ({ mode, releaseFailure, retirement }) => {
     const root = await mkdtemp(join(tmpdir(), "runnerd-detach-attachment-"));
     const entered = gate();
     const held = gate();
@@ -104,7 +105,7 @@ it.each([
       if (mode === "activation") {
         expect(core.store.state.commands.some(command => command.type === "run.attach" && command.status === "completed")).toBe(true);
       }
-      detaching = bundle.detachControllerForRestart()
+      detaching = (retirement === "detach" ? bundle.detachControllerForRestart() : bundle.transport.close())
         .then(() => { detached = true; })
         .finally(() => { detachSettled = true; });
       void detaching.catch(() => undefined);
