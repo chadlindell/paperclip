@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, it } from "vitest";
-import { inspectWarmRunTransition, type DurablePrpControlPlane, type RunnerProcessHandle, type RunnerProcessResult,
+import { inspectWarmRunTransition, inspectStagedRunAttachmentHeader, type DurablePrpCheckpoint, type DurablePrpControlPlane, type RunnerProcessHandle, type RunnerProcessResult,
   type PrpWireConnection } from "../control-plane/durable-prp-control-plane.js";
 import { createCapabilityRunnerdCodexTransport, defaultCapabilityRunnerdBinary, readRunnerdArtifactBinding } from "./runnerd-codex-transport.js";
 
@@ -185,3 +185,147 @@ it.each(["prior-release", "physical-read"] as const)("does not activate a staged
     await rm(root, { recursive: true, force: true });
   }
 }, 15_000);
+
+
+it.each(["prior-release", "physical-read"] as const)("does not activate a recovered staged listening route after detach during %s", async mode => {
+  const root = await mkdtemp(join(tmpdir(), "runner-recovery-staged-listen-"));
+  const originalRoot = join(root, "original"), recoveredRoot = join(root, "recovered");
+  const guest = createServer();
+  await new Promise<void>(done => guest.listen(0, "127.0.0.1", done));
+  const address = guest.address();
+  if (!address || typeof address === "string") throw new Error("Missing owned listener");
+  const port = address.port;
+  await new Promise<void>(done => guest.close(() => done()));
+  const source = { runnerInstanceId: "runner-recovery-listen", environmentLeaseId: "lease-recovery-listen", runId: "source-run",
+    normalizedSessionId: "session-recovery-listen", turnId: "source-turn", itemId: "source-item" };
+  const target = { ...source, runId: "target-run", turnId: "target-turn", itemId: "target-item" };
+  const queued = gate(), queuedHold = gate(), entered = gate(), held = gate();
+  let checkpoint!: DurablePrpCheckpoint, generation = 0, checkpointHeld = false, recovering = false, physicalHeld = false;
+  let core!: DurablePrpControlPlane, runnerStderr = "";
+  const registered = new WeakSet<DurablePrpControlPlane>(), cores = new Set<DurablePrpControlPlane>();
+  const routeEvents: string[] = [], routeClosers: Array<() => void> = [], connections: Promise<void>[] = [];
+  const handles: RunnerProcessHandle[] = [];
+  const binary = defaultCapabilityRunnerdBinary(), artifact = readRunnerdArtifactBinding(binary);
+  const readRunnerState = async () => {
+    const state = JSON.parse(await readFile(join(originalRoot, "runner/runner-state.json"), "utf8"));
+    if (recovering && mode === "physical-read" && !physicalHeld && core.store.state.stagedRunAttachment) {
+      const proof = inspectWarmRunTransition({ controlPlaneState: core.store.state, runnerState: state,
+        expectedNewIdentity: target, expectedRunnerVersion: artifact.version, expectedRunnerDigest: artifact.digest });
+      if (proof?.runnerIdentity.runId === target.runId) { physicalHeld = true; entered.release(); await held.promise; }
+    }
+    return state;
+  };
+  const options = {
+    runnerBinary: binary, codexCommand: resolve(import.meta.dirname, "../../runner/target/debug/fake-codex-app-server"),
+    codexArgs: ["--state-file", join(root, "provider.json"), "--call-log", join(root, "provider-calls.log")],
+    sourceCodexHome: "", stateDirectory: originalRoot, prpIdentity: source,
+    closeGraceMs: 300, runnerReconnectGraceMs: 5_000,
+    lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
+    onStagedRunAttachment: async () => {}, onRecoveryAccountingEvent: async () => {}, readRunnerState,
+    controlPlaneRegistration: async (authority: DurablePrpControlPlane, identity = authority.store.state.identity) => {
+      core = authority; cores.add(core);
+      if (!registered.has(core)) {
+        registered.add(core);
+        const epoch = generation;
+        core.setCheckpointPersistence(async saved => {
+          if (epoch !== generation) throw new Error("retired fixture writer");
+          checkpoint = saved;
+          if (!checkpointHeld && inspectStagedRunAttachmentHeader(saved.records.get("header")!)?.phase === "attachment_queued") {
+            checkpointHeld = true; queued.release(); await queuedHold.promise;
+            if (epoch !== generation) throw new Error("retired fixture writer");
+          }
+        });
+      }
+      const isTarget = identity.runId === target.runId, phase = recovering ? "recovery" : "original";
+      const name = `${phase}:${isTarget ? "target" : "source"}`;
+      const path = `/api/runner/v1/connect/${identity.runId}`;
+      let stopped = false, peer: Awaited<ReturnType<typeof openOwnedWire>> | undefined;
+      const close = () => { stopped = true; peer?.close(); }; routeClosers.push(close);
+      let resolveReady!: () => void, rejectReady!: (error: Error) => void;
+      const ready = new Promise<void>((done, fail) => { resolveReady = done; rejectReady = fail; });
+      void ready.catch(() => undefined);
+      const connect = async () => {
+        const deadline = Date.now() + 6_000;
+        while (!stopped && Date.now() < deadline) {
+          try {
+            peer = await openOwnedWire(`ws://127.0.0.1:${port}${path}`);
+            if (stopped) { peer.close(); return; }
+            authority.attachWireConnection(peer.wire); resolveReady(); await peer.closed;
+          } catch { /* The real Runner owns the listener transition. */ }
+          if (!stopped) await new Promise<void>(done => setTimeout(done, 50));
+        }
+        if (!stopped) rejectReady(new Error("Owned recovery listener never became ready"));
+      };
+      return { connection: { mode: "listen" as const, listenAddress: "0.0.0.0", listenPort: port, listenPath: path },
+        activate: () => { routeEvents.push(`${name}:activate`); connections.push(connect()); }, ready: () => ready,
+        release: async (reason?: "detach") => {
+          routeEvents.push(`${name}:release:${reason ?? "normal"}`);
+          if (phase === "recovery" && !isTarget && mode === "prior-release") { entered.release(); await held.promise; }
+          close();
+        },
+      };
+    },
+    runnerProcessLauncher: (spec: Parameters<NonNullable<Parameters<typeof createCapabilityRunnerdCodexTransport>[0]["runnerProcessLauncher"]>>[0]) => {
+      const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment, stdio: ["ignore", "ignore", "pipe"] });
+      child.stderr.on("data", bytes => { runnerStderr += bytes.toString(); });
+      const completion = new Promise<RunnerProcessResult>((done, fail) => {
+        child.once("error", fail); child.once("exit", (code, signal) => done({ code, signal, stdout: "", stderr: "" }));
+      });
+      const handle = { child, completion }; handles.push(handle); return handle;
+    },
+  };
+  const first = createCapabilityRunnerdCodexTransport(options);
+  let replacement: ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+  let attach: Promise<void> | undefined, recovery: Promise<unknown> | undefined, detaching: Promise<void> | undefined;
+  let providerPid: number | null = null;
+  try {
+    const opened = await first.transport.request("thread/start", { cwd: root });
+    providerPid = first.evidence().codexPid;
+    const runnerPid = handles[0]!.child.pid!;
+    attach = first.transport.attachRun!({ runId: target.runId, turnId: target.turnId, itemId: target.itemId });
+    void attach.catch(() => undefined);
+    await queued.promise;
+    expect(inspectStagedRunAttachmentHeader(checkpoint.records.get("header")!)?.phase).toBe("attachment_queued");
+    generation++;
+    const firstDetach = first.detachControllerForRestart(); void firstDetach.catch(() => undefined);
+    queuedHold.release(); await firstDetach.catch(() => undefined); await attach.catch(() => undefined);
+    checkpoint.restoreSessionDirectory(recoveredRoot);
+    recovering = true;
+    replacement = createCapabilityRunnerdCodexTransport({ ...options, stateDirectory: recoveredRoot, prpIdentity: target,
+      runnerStateDirectory: join(originalRoot, "runner"), runnerArtifact: artifact,
+      warmTransitionRegistrationMode: "routed_same_endpoint",
+      prepareExternalRunnerState: async () => { throw new Error("Live recovery must not replace Runner state"); },
+      resumeProviderSession: { driverSessionId: String((opened.thread as { id: string }).id),
+        providerSessionId: String((opened.thread as { sessionId: string }).sessionId) },
+      adoptExistingRunner: { pid: runnerPid, processGroupId: null, startedAt: first.transport.processInfo().startedAt,
+        isAlive: () => handles[0]!.child.exitCode === null },
+      runnerProcessLauncher: () => { throw new Error("Unexpected duplicate Runner launch"); },
+    });
+    recovery = replacement.transport.request("thread/read", {}); void recovery.catch(() => undefined);
+    await entered.promise;
+    expect(routeEvents).not.toContain("recovery:target:activate");
+    detaching = replacement.detachControllerForRestart();
+    await expect(detaching).rejects.toThrow(/startup drain timed out/);
+    held.release();
+    await expect(recovery).rejects.toThrow(/closed/);
+    expect(routeEvents).not.toContain("recovery:target:activate");
+    expect(routeEvents).toContain("recovery:target:release:detach");
+    expect(handles).toHaveLength(1);
+  } catch (error) {
+    throw new Error(`${String(error)}; Runner stderr: ${runnerStderr}; routes: ${JSON.stringify(routeEvents)}`, { cause: error });
+  } finally {
+    queuedHold.release(); held.release();
+    await attach?.catch(() => undefined); await recovery?.catch(() => undefined); await detaching?.catch(() => undefined);
+    await replacement?.detachControllerForRestart().catch(() => undefined);
+    await first.detachControllerForRestart().catch(() => undefined);
+    for (const close of routeClosers) close();
+    for (const handle of handles) {
+      if (handle.child.exitCode === null && handle.child.signalCode === null) handle.child.kill("SIGKILL");
+      await handle.completion.catch(() => undefined);
+    }
+    if (providerPid) { try { process.kill(providerPid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } }
+    await Promise.allSettled(connections);
+    for (const authority of cores) await authority.stop().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
