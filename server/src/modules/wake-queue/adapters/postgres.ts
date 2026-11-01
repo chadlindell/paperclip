@@ -237,6 +237,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              interruptQueueId ? undefined
+                : sql`${agentWakeupRequests.payload}#>>'{executionWait,cause}' is distinct from 'execution_owner_active'`,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               excludedAgentId ? ne(agentWakeupRequests.agentId, excludedAgentId) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,

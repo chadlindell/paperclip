@@ -274,7 +274,7 @@ export function executionOwnershipWaitAppliesToIssue(
   const executorWake = stage.wakeRole === "executor";
   const principal = executorWake ? state?.returnAssignee : state?.currentParticipant;
   const stageApplies = executorWake
-    ? state?.status === "changes_requested"
+    ? state?.status === "changes_requested" && state.currentStageId === stageId
     : state?.status === "pending" && state.currentStageId === stageId;
   return stageApplies && principal?.type === "agent" && principal.agentId === agentId;
 }
