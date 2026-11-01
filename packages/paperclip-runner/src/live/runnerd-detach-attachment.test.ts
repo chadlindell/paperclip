@@ -12,9 +12,14 @@ function gate() {
   return { promise, release };
 }
 
-it.each(["registration", "activation"] as const)(
-  "joins an admitted warm attachment and its route release before detach succeeds (%s)",
-  async mode => {
+it.each([
+  { mode: "registration", releaseFailure: "none" },
+  { mode: "activation", releaseFailure: "none" },
+  { mode: "activation", releaseFailure: "target" },
+  { mode: "activation", releaseFailure: "prior" },
+] as const)(
+  "joins an admitted warm attachment and preserves release failures ($mode, $releaseFailure)",
+  async ({ mode, releaseFailure }) => {
     const root = await mkdtemp(join(tmpdir(), "runnerd-detach-attachment-"));
     const entered = gate();
     const held = gate();
@@ -41,7 +46,10 @@ it.each(["registration", "activation"] as const)(
         if (!initialized) {
           initialized = true;
           await authority.start();
-          return { release: () => { routes.push("prior:released"); } };
+          return { release: () => {
+            routes.push("prior:released");
+            if (releaseFailure === "prior") throw new Error("synthetic prior route release failed");
+          } };
         }
         expect(identity?.runId).toBe("attachment-next-run");
         routes.push("next:registration-started");
@@ -64,6 +72,7 @@ it.each(["registration", "activation"] as const)(
             releaseEntered.release();
             await releaseHeld.promise;
             routes.push("next:released");
+            if (releaseFailure === "target") throw new Error("synthetic target route release failed");
           },
         };
       },
@@ -104,6 +113,12 @@ it.each(["registration", "activation"] as const)(
       expect(detached, "detach must also join that attachment's asynchronous route release").toBe(false);
       releaseHeld.release();
       await expect(attaching).rejects.toThrow(/closed/);
+      if (releaseFailure !== "none") {
+        await expect(detaching).rejects.toThrow(`synthetic ${releaseFailure} route release failed`);
+        expect(detached, "failed route cleanup must never authorize a successor").toBe(false);
+        expect(handles).toHaveLength(1);
+        return;
+      }
       await detaching;
       expect(detached).toBe(true);
       expect(routes.filter(value => value === "next:released")).toHaveLength(1);
