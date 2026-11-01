@@ -4804,7 +4804,7 @@ it("fences a queued semantic input before stopped ingress finishes draining", as
     client = await authenticate(core, core.issueBootstrapTicket());
     sendSecure(client!, semanticInputEvent());
     await vi.waitFor(() => expect(checkpointEntered).toBe(true));
-    (core as DurablePrpControlPlane & { fenceSemanticToolCallbacks?: () => void }).fenceSemanticToolCallbacks?.();
+    core.fenceSemanticToolCallbacks();
     core.disconnectActiveRunner();
     await core.stop();
     const draining = core.drainPendingConnectionProcessing();
@@ -4839,7 +4839,7 @@ it.each(["success", "not_dispatched"] as const)("fences a late semantic %s resul
     await core.start(); client = await authenticate(core, core.issueBootstrapTicket());
     sendSecure(client!, semanticInputEvent());
     await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
-    (core as DurablePrpControlPlane & { fenceSemanticToolCallbacks?: () => void }).fenceSemanticToolCallbacks?.();
+    core.fenceSemanticToolCallbacks();
     // Stop/drain need not succeed for the synchronous fence to revoke writes.
     expect(() => core.retireSemanticToolCallbacks()).toThrow("drained, stopped ingress");
     const before = readFileSync(resolve(root, "control-plane-state.json"), "utf8");
@@ -4868,7 +4868,7 @@ it("fences semantic recovery before invoking an external reconciler", async () =
     expect((await receiveSecure(client!))!.kind).toBe("ack");
     await original.stop(); await original.drainPendingConnectionProcessing();
     replacement = new DurablePrpControlPlane({ ...options, recoverSemanticToolInput: recover });
-    (replacement as DurablePrpControlPlane & { fenceSemanticToolCallbacks?: () => void }).fenceSemanticToolCallbacks?.();
+    replacement.fenceSemanticToolCallbacks();
     await replacement.recoverPendingSemanticInputs();
     expect(recover).not.toHaveBeenCalled();
     expect(replacement.store.state.commands).toHaveLength(0);
