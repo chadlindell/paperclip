@@ -27,7 +27,7 @@ describe("native status continuation behind outgoing ownership", () => {
   async function fixture() {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID(), previousAgentId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Native handoff", defaultResponsibleUserId: "board" });
+    await db.insert(companies).values({ id: companyId, name: "Native handoff", issuePrefix: `N${companyId.replaceAll("-", "")}`, defaultResponsibleUserId: "board" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", status: "idle", adapterType: "process",
       adapterConfig: { command: process.execPath, args: ["-e", "throw Error('provider must not launch')"] },
       runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
