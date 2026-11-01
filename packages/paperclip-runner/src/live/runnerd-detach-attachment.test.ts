@@ -18,6 +18,7 @@ it.each([
   { mode: "activation", releaseFailure: "target", retirement: "detach" },
   { mode: "activation", releaseFailure: "prior", retirement: "detach" },
   { mode: "registration", releaseFailure: "target", retirement: "close" },
+  { mode: "prior-release", releaseFailure: "none", retirement: "detach" },
 ] as const)(
   "joins an admitted warm attachment and preserves release failures ($mode, $releaseFailure, $retirement)",
   async ({ mode, releaseFailure, retirement }) => {
@@ -28,6 +29,7 @@ it.each([
     const releaseHeld = gate();
     const handles: RunnerProcessHandle[] = [];
     const routes: string[] = [];
+    const releaseReasons: Array<{ route: string; reason: string | undefined }> = [];
     let core!: DurablePrpControlPlane;
     let initialized = false;
     let attaching: Promise<void> | undefined;
@@ -41,14 +43,19 @@ it.each([
       codexArgs: ["--state-file", join(root, "provider.json"), "--call-log", providerLog],
       sourceCodexHome: "",
       stateDirectory: root,
-      closeGraceMs: 5_000,
+      closeGraceMs: mode === "prior-release" ? 100 : 5_000,
       lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
       controlPlaneRegistration: async (authority, identity) => {
         core = authority;
         if (!initialized) {
           initialized = true;
           await authority.start();
-          return { release: () => {
+          return { release: (reason) => {
+            releaseReasons.push({ route: "prior", reason });
+            if (mode === "prior-release") {
+              entered.release();
+              return held.promise.then(() => { routes.push("prior:released"); });
+            }
             routes.push("prior:released");
             if (releaseFailure === "prior") throw new Error("synthetic prior route release failed");
           } };
@@ -69,7 +76,8 @@ it.each([
             }
             routes.push("next:activated");
           },
-          release: async () => {
+          release: async (reason) => {
+            releaseReasons.push({ route: "next", reason });
             routes.push("next:release-started");
             releaseEntered.release();
             await releaseHeld.promise;
@@ -109,6 +117,18 @@ it.each([
         .then(() => { detached = true; })
         .finally(() => { detachSettled = true; });
       void detaching.catch(() => undefined);
+      if (mode === "prior-release") {
+        await expect(detaching).rejects.toThrow("startup drain timed out");
+        expect(detached).toBe(false);
+        held.release();
+        releaseHeld.release();
+        await expect(attaching).rejects.toThrow(/closed/);
+        expect(routes.filter(value => value === "next:released")).toHaveLength(1);
+        expect(releaseReasons.filter(value => value.route === "next")).toEqual([{ route: "next", reason: "detach" }]);
+        await expect(bundle.detachControllerForRestart()).rejects.toThrow("startup drain timed out");
+        expect(handles).toHaveLength(1);
+        return;
+      }
       await new Promise(done => setTimeout(done, 100));
       expect(detachSettled, "detach must join the originally admitted attachment callback").toBe(false);
       held.release();
