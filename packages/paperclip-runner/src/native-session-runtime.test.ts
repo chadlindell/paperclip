@@ -1248,6 +1248,8 @@ describe("executeNativeSession recovery", () => {
   it.each([
     { status: "active", code: "semantic_completion_rejected", recoverable: false },
     { status: "complete", code: "semantic_completion_rejected", recoverable: false },
+    { status: "active", code: "semantic_completion_missing", recoverable: false },
+    { status: "complete", code: "semantic_completion_missing", recoverable: false },
     { status: "complete", code: "provider_output_failed", recoverable: false },
     { status: "active", code: "provider_turn_lost_on_restore", recoverable: true },
   ] as const)(
