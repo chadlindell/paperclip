@@ -178,13 +178,13 @@ describe("native status continuation behind outgoing ownership", () => {
     expect((await successors(f)).filter(run => run.id !== stopped.id && run.id !== later.id)).toHaveLength(0);
   });
 
-  it("keeps a fresh post-Stop continuation distinct from a held pre-Stop intent in the same batch", async () => {
+  it.each([true, false])("preserves one eligible successor for parked native intents (intervening Stop: %s)", async stoppedByOperator => {
     const f = await fixture();
-    const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+    const [stopped] = stoppedByOperator ? await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
       resultJson: { executionCancellation: { state: "acknowledged" },
         cancellation: { source: "operator", reason: "Stopped by operator", expected: true } },
-    }).returning();
+    }).returning() : [];
     // A later explicitly resumed run produces a distinct real committer intent.
     // Leave both outbox entries undispatched to exercise one delivery batch.
     const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
@@ -212,27 +212,37 @@ describe("native status continuation behind outgoing ownership", () => {
     const fresh = { ...f, intentId: effect.targetId! };
     expect(fresh.intentId).not.toBe(f.intentId);
     const [freshIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, fresh.intentId));
-    expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
+    if (stopped) expect(freshIntent.requestedAt.getTime()).toBeGreaterThan(stopped.finishedAt!.getTime());
     await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     const [oldSaved] = await dispatches(f);
     expect(oldSaved).toMatchObject({ status: "deferred_issue_execution", runId: null });
     const [freshSaved] = await dispatches(fresh);
-    expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
+    if (stopped) expect(freshSaved).toMatchObject({ status: "deferred_issue_execution", runId: null,
       payload: { _paperclipWakeContext: { nativeStatusWakeIntentId: fresh.intentId } } });
-    expect(freshSaved.id).not.toBe(oldSaved.id);
+    if (stopped) expect(freshSaved.id).not.toBe(oldSaved.id);
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
       .where(eq(environmentLeases.id, f.lease.id));
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
       .where(eq(agentWakeupRequests.companyId, f.companyId));
     const worker = await start();
-    const admitted = (await successors(f)).filter(run => ![stopped.id, freshRunId].includes(run.id));
+    const admitted = (await successors(f)).filter(run => ![stopped?.id, freshRunId].includes(run.id));
     expect(admitted).toHaveLength(1);
-    expect(admitted[0]).toMatchObject({ status: "queued", contextSnapshot: { nativeStatusWakeIntentId: fresh.intentId } });
-    expect((await dispatches(f))[0]).toMatchObject({ id: oldSaved.id, status: "deferred_issue_execution", runId: null });
-    expect((await dispatches(fresh))[0]).toMatchObject({ id: freshSaved.id, status: "queued", runId: admitted[0].id });
+    expect(admitted[0]).toMatchObject({ status: "queued", contextSnapshot: { nativeStatusWakeIntentId: stopped ? fresh.intentId : f.intentId } });
+    if (stopped) expect((await dispatches(f))[0]).toMatchObject({ id: oldSaved.id, status: "deferred_issue_execution", runId: null });
+    if (stopped) expect((await dispatches(fresh))[0]).toMatchObject({ id: freshSaved.id, status: "queued", runId: admitted[0].id });
     await worker.stop();
+    // Finish the first successor while the task remains in progress, then
+    // recover through the normal release adapter. A duplicate parked intent
+    // must not become a second sequential turn after completion.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, admitted[0].id));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionLockedAt: null })
+      .where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
     await start();
-    expect((await successors(f)).filter(run => ![stopped.id, freshRunId].includes(run.id))).toHaveLength(1);
+    if (stopped) expect((await dispatches(f))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await successors(f)).filter(run => ![stopped?.id, freshRunId].includes(run.id))).toHaveLength(1);
   });
 
   it("does not promote a former assignee's older native receipt ahead of the current assignee", async () => {
