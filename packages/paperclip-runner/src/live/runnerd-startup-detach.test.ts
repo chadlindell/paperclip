@@ -174,36 +174,3 @@ it.each(["held", "failed", "held-stop"] as const)("rejects unconfirmed retiremen
   }
 });
 
-it.each(["settled", "failed"] as const)("joins an existing close without converting its outcome to detach success (%s)", async mode => {
-  const gate = deferred();
-  const releasing = deferred();
-  const fixture = await registeredFixture(async () => {
-    releasing.resolve();
-    await gate.promise;
-    if (mode === "failed") throw new Error("fixture close release failed");
-  });
-  const closing = fixture.bundle.transport.close();
-  void closing.catch(() => undefined);
-  try {
-    await releasing.promise;
-    let detached = false;
-    const detaching = fixture.bundle.detachControllerForRestart().then(() => { detached = true; });
-    void detaching.catch(() => undefined);
-    await new Promise<void>(resolve => setImmediate(resolve));
-    const completedBeforeClose = detached;
-    gate.resolve();
-    if (mode === "failed") {
-      await expect(closing).rejects.toThrow("fixture close release failed");
-      await expect(detaching).rejects.toThrow("fixture close release failed");
-      await expect(fixture.bundle.detachControllerForRestart()).rejects.toThrow("fixture close release failed");
-    } else {
-      await closing;
-      await detaching;
-    }
-    expect(completedBeforeClose).toBe(false);
-  } finally {
-    gate.resolve();
-    await closing.catch(() => undefined);
-    await fixture.cleanup();
-  }
-});

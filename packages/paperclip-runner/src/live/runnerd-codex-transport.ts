@@ -3628,6 +3628,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #probeRetirement: Promise<void> | null = null;
   readonly prepareConversationResume?: CodexAppServerTransport["prepareConversationResume"];
   #detachPromise: Promise<void> | null = null;
+  #attachmentCleanupFailure: Error | null = null;
   #startupOperation: Promise<unknown> | null = null;
   #attachmentOperation: Promise<void> | null = null;
   #startupDrainTimedOut = false;
@@ -4304,6 +4305,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           : Math.min(Date.now() + 30_000, this.#sourceAttachmentDeadline),
         true,
       );
+      this.#assertStartupOpen();
       const attached = core.getCommand(commandId);
       if (attached?.status !== "completed") {
         throw new Error("native_runner_prp_run_rotation_failed");
@@ -4367,7 +4369,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (!this.#closed) this.#controlPlaneRelease = previousReleased ? null : previousRelease;
       await Promise.resolve()
         .then(() => registration?.release())
-        .catch(() => undefined);
+        .catch((error: unknown) => {
+          this.#attachmentCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+        });
       if (activationStarted) {
         // Once the completed handoff is exposed, an activation failure makes
         // both routes unavailable; neither remains an ordinary-work owner.
@@ -4375,7 +4379,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         if (!previousReleased) {
           await Promise.resolve()
             .then(() => previousRelease?.())
-            .catch(() => undefined);
+            .catch((error: unknown) => {
+              this.#attachmentCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+            });
         }
         this.#failTransport(failure);
       }
@@ -4662,63 +4668,72 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return this.#detachPromise;
   }
 
+  async #withinRetirementDeadline<T>(work: () => Promise<T> | T, deadline: number, phase: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(work),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(
+            `Controller ${phase} timed out; preserve the session before replacing its writer.`,
+          )), Math.max(0, deadline - Date.now()));
+        }),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
+
+  #throwRetirementFailures(failures: unknown[]): void {
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures,
+      failures.map(error => error instanceof Error ? error.message : String(error)).join("; "),
+      { cause: failures[0] });
+  }
+
   async #stopAndDrainAuthority(deadline: number): Promise<void> {
     const core = this.#core;
     if (!core) return;
     core.fenceSemanticToolCallbacks();
-    await core.stop();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        core.drainPendingConnectionProcessing(),
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error(
-            "Controller journal drain timed out; preserve the session before replacing its writer.",
-          )), Math.max(0, deadline - Date.now()));
-        }),
-      ]);
-      core.retireSemanticToolCallbacks();
-    } finally {
-      clearTimeout(timer);
-    }
+    const failures: unknown[] = [];
+    try { await this.#withinRetirementDeadline(() => core.stop(), deadline, "ingress stop"); }
+    catch (error) { failures.push(error); }
+    try { await this.#withinRetirementDeadline(() => core.drainPendingConnectionProcessing(), deadline, "journal drain"); }
+    catch (error) { failures.push(error); }
+    this.#throwRetirementFailures(failures);
+    core.retireSemanticToolCallbacks();
   }
 
   async #detachControllerOnce(): Promise<void> {
-    if (this.#closed) return;
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
-    const startup = this.#startupOperation;
+    const closing = this.#closePromise;
+    if (closing !== null) {
+      // Close already owns process settlement. Do not redirect it back to this
+      // detach promise or reinterpret a failed close as retirement proof.
+      await this.#withinRetirementDeadline(() => closing, deadline, "close drain");
+      if (this.#attachmentCleanupFailure) throw this.#attachmentCleanupFailure;
+      return;
+    }
+    if (this.#closed) throw new Error("Controller retirement is unconfirmed");
+    const admitted = [this.#startupOperation, this.#attachmentOperation];
     this.#controllerDetachedForRestart = true;
     this.#core?.fenceSemanticToolCallbacks();
+    this.#closed = true;
     this.#resolveClosedSignal();
     this.#turnStartAdmission?.resolve(false);
-    let startupTimer: ReturnType<typeof setTimeout> | undefined;
-    // The synchronous semantic fence makes releasing waiters safe: their
-    // inputs remain pending for the successor. Successful retirement still
-    // requires joining startup, ingress and persistence below.
+    // Fencing makes waiter release safe. A successful takeover also requires
+    // admitted work and every owned ingress/persistence cleanup to settle.
+    const failures: unknown[] = [];
     try {
-      if (startup !== null) {
-        // Resume can still archive state or create its core after an admitted
-        // preparation await. Settlement, including rejection, must precede
-        // successful writer retirement; timeout never authorizes a successor.
-        await Promise.race([
-          startup.then(() => undefined, () => undefined),
-          new Promise<never>((_resolve, reject) => {
-            startupTimer = setTimeout(() => reject(new Error(
-              "Controller startup drain timed out; preserve the session before replacing its writer.",
-            )), Math.max(0, deadline - Date.now()));
-          }),
-        ]);
-      }
+      try {
+        await this.#withinRetirementDeadline(() => Promise.allSettled(admitted), deadline, "startup drain");
+      } catch (error) { failures.push(error); }
+      if (this.#attachmentCleanupFailure) failures.push(this.#attachmentCleanupFailure);
       this.#core?.fenceSemanticToolCallbacks();
-      await this.#retireControllerForRecovery(deadline);
-    } finally {
-      clearTimeout(startupTimer);
-      // A failed drain also closes this transport, but rejects detach so no
-      // successor is authorized to replace its unretired journal writer.
-      this.#closed = true;
-      this.#resolveClosedSignal();
-      this.#turnStartAdmission?.resolve(false);
-    }
+      // A timed-out join still owes cleanup, but cleanup success never erases
+      // the failed join or grants permission to replace its retained writer.
+      try { await this.#retireControllerForRecovery(deadline); }
+      catch (error) { failures.push(error); }
+      this.#throwRetirementFailures(failures);
+    } finally { this.#queue.close(); }
     this.#handle = null;
     this.#diagnostic(
       "controller authority detached for restart; durable runner left alive",
@@ -4734,16 +4749,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#core?.disconnectActiveRunner();
     const release = this.#controlPlaneRelease;
     this.#controlPlaneRelease = null;
-    await Promise.resolve(release?.("detach")).catch((error: unknown) => {
-      this.#diagnostic(
-        `controller route release failed during retirement: ${String(error)}`,
-      );
-    });
+    const failures: unknown[] = [];
     try {
-      await this.#stopAndDrainAuthority(deadline);
-    } finally {
-      this.#queue.close();
-    }
+      try { await this.#withinRetirementDeadline(() => release?.("detach"), deadline, "route release"); }
+      catch (error) { failures.push(error); }
+      try { await this.#stopAndDrainAuthority(deadline); }
+      catch (error) { failures.push(error); }
+      this.#throwRetirementFailures(failures);
+    } finally { this.#queue.close(); }
   }
 
   #trackStartup<T>(start: () => Promise<T>): Promise<T> {
