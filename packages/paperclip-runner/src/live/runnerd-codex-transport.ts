@@ -4686,14 +4686,33 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #detachControllerOnce(): Promise<void> {
     if (this.#closed) return;
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
+    const startup = this.#startupOperation;
     this.#controllerDetachedForRestart = true;
     this.#core?.fenceSemanticToolCallbacks();
+    this.#resolveClosedSignal();
+    this.#turnStartAdmission?.resolve(false);
+    let startupTimer: ReturnType<typeof setTimeout> | undefined;
     // Retire the journal writer before releasing waiting semantic handlers.
     // Controller loss leaves their inputs pending for the successor; it must
     // not manufacture cancellation results during old-controller cleanup.
     try {
+      if (startup !== null) {
+        // Resume can still archive state or create its core after an admitted
+        // preparation await. Settlement, including rejection, must precede
+        // successful writer retirement; timeout never authorizes a successor.
+        await Promise.race([
+          startup.then(() => undefined, () => undefined),
+          new Promise<never>((_resolve, reject) => {
+            startupTimer = setTimeout(() => reject(new Error(
+              "Controller startup drain timed out; preserve the session before replacing its writer.",
+            )), Math.max(0, deadline - Date.now()));
+          }),
+        ]);
+      }
+      this.#core?.fenceSemanticToolCallbacks();
       await this.#retireControllerForRecovery(deadline);
     } finally {
+      clearTimeout(startupTimer);
       // A failed drain also closes this transport, but rejects detach so no
       // successor is authorized to replace its unretired journal writer.
       this.#closed = true;
