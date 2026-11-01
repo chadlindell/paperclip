@@ -13,7 +13,9 @@ function gate() {
 
 // Controlled durable checkpoint and public transport API. No Runner or provider
 // process is launched: this proves controller cleanup, not native execution.
-it.each([false, true])("preserves source-route cleanup during admitted warm resume (release failure: %s)", async failRelease => {
+it.each(["released", "release-failed", "composite-sync-failed"] as const)("preserves source-route cleanup during admitted warm resume (%s)", async mode => {
+  const failRelease = mode !== "released";
+  const composite = mode === "composite-sync-failed";
   const root = await mkdtemp(join(tmpdir(), "runner-warm-resume-detach-"));
   const source = { runnerInstanceId: "runner-warm-resume", environmentLeaseId: "lease-warm-resume",
     runId: "source-run", normalizedSessionId: "session-warm-resume", turnId: "source-turn", itemId: "source-item" };
@@ -36,14 +38,25 @@ it.each([false, true])("preserves source-route cleanup during admitted warm resu
   queued.stagedRunAttachment = { ...staged, commandId: "queued-attachment" };
   seed.store.commit(queued);
   const entered = gate(), held = gate(), releaseEntered = gate(), releaseHeld = gate();
-  const releaseRoute = vi.fn(async () => {
-    releaseEntered.release();
-    await releaseHeld.promise;
-    if (failRelease) throw new Error("synthetic source registration release failed");
+  const releaseRoute = vi.fn((_reason?: "detach") => {
+    if (composite) throw new Error("synthetic source registration release failed");
+    return (async () => {
+      releaseEntered.release();
+      await releaseHeld.promise;
+      if (failRelease) throw new Error("synthetic source registration release failed");
+    })();
   });
+  const releaseTarget = vi.fn(async (_reason?: "detach") => { releaseEntered.release(); await releaseHeld.promise; });
   const launch = vi.fn(() => { throw new Error("Unexpected native launch"); });
   const registration = vi.fn(async (_core: DurablePrpControlPlane, identity = source) => {
+    if (composite && identity.runId === target.runId) {
+      return { connection, release: releaseTarget };
+    }
     expect(identity).toEqual(source);
+    if (composite) return {
+      connection: { mode: "connect" as const, connectUrl: "ws://127.0.0.1:31999/source" }, release: releaseRoute,
+      activate: async () => { entered.release(); await held.promise; },
+    };
     entered.release();
     await held.promise;
     return { connection: { mode: "connect" as const, connectUrl: "ws://127.0.0.1:31999/source" }, release: releaseRoute };
@@ -69,7 +82,7 @@ it.each([false, true])("preserves source-route cleanup during admitted warm resu
     await new Promise(done => setImmediate(done));
     expect(settled).toBe(false);
     held.release();
-    await releaseEntered.promise;
+    await Promise.race([releaseEntered.promise, detaching.then(() => { throw new Error("Detached before releasing the owned route"); })]);
     await new Promise(done => setImmediate(done));
     expect(settled).toBe(false);
     releaseHeld.release();
@@ -77,7 +90,11 @@ it.each([false, true])("preserves source-route cleanup during admitted warm resu
     if (failRelease) await expect(detaching).rejects.toThrow("synthetic source registration release failed");
     else await detaching;
     expect(releaseRoute).toHaveBeenCalledOnce();
-    expect(registration).toHaveBeenCalledOnce();
+    expect(registration).toHaveBeenCalledTimes(composite ? 2 : 1);
+    if (composite) {
+      expect(releaseTarget).toHaveBeenCalledExactlyOnceWith("detach");
+      expect(releaseRoute).toHaveBeenCalledExactlyOnceWith("detach");
+    }
     expect(launch).not.toHaveBeenCalled();
     const retired = await readFile(seed.store.path, "utf8");
     await new Promise(done => setImmediate(done));
