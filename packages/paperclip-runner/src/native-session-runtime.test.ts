@@ -1279,6 +1279,65 @@ describe("executeNativeSession recovery", () => {
     expect(completeRun).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
   });
 
+  it.each((["complete", "paused", "blocked", "cleared"] as const).flatMap(status =>
+    (["new_turn", "same_turn_replay", "initial_start_replay", "fresh_report", "missing_start_id", "missing_report_id"] as const)
+      .map(order => ({ status, order }))))
+  ("scopes goal completion authority to its provider turn ($status, $order)", async ({ status, order }) => {
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const active = { threadId: "provider-recovery", objective: "Perform assigned work", status: "active" as const,
+      tokenBudget: null, tokensUsed: 100, timeUsedSeconds: 1, createdAt: 1, updatedAt: 2 };
+    const fresh = { ...result, summary: "The new provider turn explicitly reported its own result." };
+    const close = vi.fn(async () => {}), completeRun = vi.fn(async () => {});
+    const goal = vi.fn(async () => active);
+    const preserved = order === "same_turn_replay" || order === "initial_start_replay";
+    const reported = preserved || order === "fresh_report";
+    const session: NativeSession = {
+      identity: () => identity, capabilities: async () => capabilities,
+      startTurn: async () => ({ turnId: "provider-turn-1" }), goal,
+      async *events() {
+        let seq = 0;
+        const event = (kind: PrpEvent["eventType"], turnId: string | undefined, payload: Record<string, unknown> = {}) =>
+          ({ ...runnerEvent(++seq, kind, payload), turnId });
+        yield event("session.goal.updated", "provider-turn-1", { goal: active, workingNow: true });
+        if (order !== "initial_start_replay") yield event("turn.started", "provider-turn-1");
+        yield event("run.result.proposed", order === "missing_report_id" ? undefined : "provider-turn-1", result);
+        if (order === "initial_start_replay") yield event("turn.started", "provider-turn-1");
+        yield event("turn.completed", "provider-turn-1");
+        const nextTurn = preserved || order === "missing_report_id" ? "provider-turn-1" : "provider-turn-2";
+        yield event("turn.started", order === "missing_start_id" ? undefined : nextTurn);
+        if (order === "fresh_report") yield event("run.result.proposed", nextTurn, fresh);
+        // Clearing can arrive while the next turn is still active. Its missing
+        // workingNow must not resurrect an earlier turn's fulfilled contract.
+        if (status !== "cleared") yield event("turn.completed", nextTurn);
+        yield event(status === "cleared" ? "session.goal.cleared" : "session.goal.updated", nextTurn,
+          status === "cleared" ? {} : { goal: { ...active, status }, workingNow: false });
+      },
+      result: async () => null,
+      snapshot: async () => ({ backendKind: "mock", sessionId: "turn-goal-authority", identity,
+        providerSessionId: active.threadId, cursor: null, activeTurnId: null, pendingRuntimeRequests: [], goal: active }), close,
+    };
+    const run = executeNativeSession({ input, backend: {
+      descriptor: async () => ({ kind: "mock", name: "turn-goal-authority", version: "1", capabilities }), openSession: async () => session,
+    }, controlPlane: { async openRun() {}, async checkpointSession() {},
+      async appendEvent(event) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun,
+    }, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" });
+    if (!reported && status === "complete") {
+      await expect(run).rejects.toMatchObject({ code: "native_provider_terminal_failed", providerCode: "semantic_completion_missing", recoverable: false });
+      expect(completeRun).not.toHaveBeenCalled();
+    } else if (reported) {
+      await expect(run).resolves.toMatchObject({ result: order === "fresh_report" ? fresh : result });
+      expect(completeRun).toHaveBeenCalledOnce();
+    } else {
+      await expect(run).resolves.toMatchObject({ result: {
+        reportedWorkDisposition: status === "blocked" ? "blocked" : "yielded",
+        completionClaim: { objectiveSatisfied: false },
+      } });
+      expect(completeRun).toHaveBeenCalledOnce();
+    }
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("requires a semantic report for goal completion arriving after the active turn (report=%s)", async reported => {
     const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
     const active = { threadId: "provider-recovery", objective: "Perform the assigned work", status: "active" as const,
