@@ -641,9 +641,21 @@ const support = await getEmbeddedPostgresTestSupport();
     async function settle() {
       await vi.advanceTimersByTimeAsync(30_000);
       const deadline = performance.now() + 5000;
-      while (idleWorkSnapshot().active && performance.now() < deadline) await delay(20);
+      let clockSteps = 0;
+      while (idleWorkSnapshot().active && performance.now() < deadline) {
+        if (passes.size) {
+          await Promise.race([Promise.allSettled([...passes]), delay(20)]);
+          await delay(0);
+          continue;
+        }
+        const next = coordinators.map(c => c.nextWakeAt()).filter(at => at !== null);
+        if (next.length && clockSteps < 10) {
+          clockSteps++;
+          await vi.advanceTimersByTimeAsync(Math.max(1, Math.min(...next) - Date.now()));
+        } else await delay(20);
+      }
       expect(idleWorkSnapshot().active, JSON.stringify({ passes: passes.size,
-        now: Date.now(), next: coordinators.map(c => c.nextWakeAt()) })).toBe(0);
+        clockSteps, now: Date.now(), next: coordinators.map(c => c.nextWakeAt()) })).toBe(0);
       expect(errors).toEqual([]);
     }
     async function quiet(c: Awaited<ReturnType<typeof start>>) {
