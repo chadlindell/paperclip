@@ -25,7 +25,6 @@ import { initializeRunIdentity, reserveSteeredIdentity, reconcileSteeredIdentity
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
-import { PaperclipRunnerSemanticAuthority } from "./runner-semantic-authority.js";
 import { createAssignedMcpTools } from "./assigned-mcp-tools.js";
 import type { ToolGatewayService } from "../tool-gateway.js";
 import { CURRENT_WAKE_COMMENTS_BINDING_SCHEMA, READ_CURRENT_WAKE_COMMENTS_TOOL_NAME } from "./current-wake-comments.js";
@@ -351,7 +350,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     }
   });
 
-  it("preserves platform receipt provenance in both mixed task history readers", async () => {
+  it("preserves platform receipt provenance in task history", async () => {
     const at = new Date("2026-10-10T12:00:00Z");
     const commentIds = Array.from({ length: 4 }, () => randomUUID());
     const requestId = randomUUID();
@@ -369,16 +368,9 @@ describe("PaperclipRunnerToolAuthority", () => {
     ]);
     try {
       const tool = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
-      const semantic = new PaperclipRunnerSemanticAuthority(db, { companyId, agentId, issueId, runId });
-      const histories = [
-        async (limit: number) => tool.execute({ tool: "get_task_history", callId: `mixed-tool-history-${limit}`, arguments: { limit } }),
-        async (limit: number) => {
-          const result = await semantic.dispatch({ callId: `mixed-semantic-history-${limit}`, operationId: "get_task_history", input: { limit },
-            correlation: { runId, normalizedSessionId: randomUUID(), turnId: "history", itemId: "history" } });
-          expect(result).toMatchObject({ ok: true });
-          return result.ok ? result.value : null;
-        },
-      ];
+      const history = (limit: number) => tool.execute({
+        tool: "get_task_history", callId: `mixed-tool-history-${limit}`, arguments: { limit },
+      });
       const expected = [
         { id: commentIds[0], authorAgentId: null, authorUserId: "board-user", origin: "comment", body: "Check the configuration." },
         { id: commentIds[1], authorAgentId: agentId, authorUserId: null, origin: "fast_response",
@@ -386,10 +378,8 @@ describe("PaperclipRunnerToolAuthority", () => {
         { id: commentIds[2], authorAgentId: agentId, authorUserId: null, origin: "comment",
           body: "Verified the configuration: two settings need updates." },
       ];
-      for (const history of histories) {
-        expect(await history(3)).toMatchObject({ comments: expected });
-        expect(await history(2)).toMatchObject({ comments: expected.slice(1) });
-      }
+      expect(await history(3)).toMatchObject({ comments: expected });
+      expect(await history(2)).toMatchObject({ comments: expected.slice(1) });
       expect((await db.select().from(issueComments).where(eq(issueComments.id, commentIds[1])))[0])
         .toMatchObject({ id: commentIds[1], origin: "fast_response", fastResponseRequestId: requestId,
           authorAgentId: agentId, body: "I will check the configuration." });
@@ -398,7 +388,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     }
   });
 
-  it.each([false, true])("legacy history preserves source trust for a current reader run (low trust: %s)", async (lowTrustReader) => {
+  it.each([false, true])("task history preserves source trust for a current reader run (low trust: %s)", async (lowTrustReader) => {
     const commentIds = Array.from({ length: 4 }, () => randomUUID());
     const [originalRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const [originalIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -429,13 +419,11 @@ describe("PaperclipRunnerToolAuthority", () => {
         // Relaxing the live task must not relabel the already-admitted reader run.
         await db.update(issues).set({ executionPolicy: null }).where(eq(issues.id, issueId));
       }
-      const semantic = new PaperclipRunnerSemanticAuthority(db, { companyId, agentId, issueId, runId });
-      const result = await semantic.dispatch({
-        callId: `legacy-trust-history-${lowTrustReader}`, operationId: "get_task_history", input: { limit: 4 },
-        correlation: { runId, normalizedSessionId: randomUUID(), turnId: "history", itemId: "history" },
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+      const result = await authority.execute({
+        tool: "get_task_history", callId: `trust-history-${lowTrustReader}`, arguments: { limit: 4 },
       });
-      expect(result).toMatchObject({ ok: true });
-      expect(result.ok ? result.value : null).toMatchObject({ comments: [
+      expect(result).toMatchObject({ comments: [
         { id: commentIds[0], sourceTrust: quarantine,
           body: lowTrustReader ? "QUARANTINED legacy history canary" : LOW_TRUST_QUARANTINED_BODY },
         { id: commentIds[1], origin: "fast_response", sourceTrust: quarantine,
@@ -1556,7 +1544,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).toHaveLength(3);
   });
 
-  it("rejects mutations after reassignment, run replacement, or terminalization", async () => {
+  it("rechecks read and mutation authority after reassignment, run replacement, or terminalization", async () => {
     const guardedIssueId = "00000000-0000-4000-8000-000000000107";
     const guardedRunId = "00000000-0000-4000-8000-000000000108";
     const guardedReplacementRunId = "00000000-0000-4000-8000-000000000109";
@@ -1602,6 +1590,12 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId: guardedIssueId,
       runId: guardedRunId,
     });
+    const readContext = (callId: string) => authority.execute({
+      tool: "get_task_context", callId, arguments: {},
+    });
+    await expect(readContext("guarded-context")).resolves.toMatchObject({
+      activeTask: { id: guardedIssueId }, run: { id: guardedRunId },
+    });
     const mutation = {
       tool: "report_progress",
       callId: "guarded-progress",
@@ -1615,6 +1609,9 @@ describe("PaperclipRunnerToolAuthority", () => {
       .update(issues)
       .set({ assigneeAgentId: null })
       .where(eq(issues.id, guardedIssueId));
+    await expect(readContext("reassigned-context")).rejects.toThrow(
+      "paperclip_runner_tool_binding_not_authorized",
+    );
     await expect(authority.execute(mutation)).rejects.toThrow(
       "paperclip_runner_tool_binding_not_authorized",
     );
@@ -1626,6 +1623,9 @@ describe("PaperclipRunnerToolAuthority", () => {
         executionRunId: guardedReplacementRunId,
       })
       .where(eq(issues.id, guardedIssueId));
+    await expect(readContext("replaced-run-context")).rejects.toThrow(
+      "paperclip_runner_tool_binding_not_authorized",
+    );
     await expect(
       authority.execute({ ...mutation, callId: "replaced-run" }),
     ).rejects.toThrow("paperclip_runner_tool_binding_not_authorized");
@@ -1638,6 +1638,9 @@ describe("PaperclipRunnerToolAuthority", () => {
       .update(heartbeatRuns)
       .set({ status: "succeeded" })
       .where(eq(heartbeatRuns.id, guardedRunId));
+    await expect(readContext("terminal-run-context")).rejects.toThrow(
+      "paperclip_runner_tool_binding_not_authorized",
+    );
     await expect(
       authority.execute({ ...mutation, callId: "terminal-run" }),
     ).rejects.toThrow("paperclip_runner_tool_binding_not_authorized");

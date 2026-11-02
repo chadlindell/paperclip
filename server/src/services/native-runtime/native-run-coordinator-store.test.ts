@@ -26,7 +26,6 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
-import { PaperclipRunnerSemanticAuthority } from "./runner-semantic-authority.js";
 import { nativeSha256 } from "./canonical.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -93,7 +92,7 @@ function runnerEvent(seed: SeededNativeRun, sourceSeq = 1): PrpEvent {
   };
 }
 
-describeEmbeddedPostgres("native run coordinator store and semantic authority", () => {
+describeEmbeddedPostgres("native run coordinator store", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
     ReturnType<typeof startEmbeddedPostgresTestDatabase>
@@ -218,46 +217,6 @@ describeEmbeddedPostgres("native run coordinator store and semantic authority", 
       completionContractCriterionIds: [],
     });
   }
-
-  it("rechecks task ownership and returns semantic receipts", async () => {
-    const seed = await seedNativeRun();
-    const authority = new PaperclipRunnerSemanticAuthority(db, {
-      companyId: seed.companyId,
-      issueId: seed.issueId,
-      runId: seed.runId,
-      agentId: seed.agentId,
-    });
-    const call = {
-      callId: "call-1",
-      operationId: "get_task_context",
-      correlation: {
-        runId: seed.runId,
-        normalizedSessionId: seed.sessionId,
-        turnId: "turn-1",
-        itemId: "item-1",
-      },
-      input: {},
-    };
-    const allowed = await authority.dispatch(call);
-    expect(allowed).toMatchObject({
-      ok: true,
-      operationId: "get_task_context",
-      value: { activeTask: { id: seed.issueId }, run: { id: seed.runId } },
-      inputReceipt: { phase: "input" },
-      resultReceipt: { phase: "result" },
-    });
-
-    await db
-      .update(issues)
-      .set({ assigneeAgentId: null })
-      .where(eq(issues.id, seed.issueId));
-    const denied = await authority.dispatch({ ...call, callId: "call-2" });
-    expect(denied).toMatchObject({
-      ok: false,
-      error: { code: "task_ownership_denied", retryable: false },
-      resultReceipt: { phase: "result" },
-    });
-  });
 
   it("persists NUL-containing command output without changing replay identity", async () => {
     const seed = await seedNativeRun();

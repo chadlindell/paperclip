@@ -13,7 +13,6 @@ import { finalizeNativeRun, pendingNativeGovernance } from "./native-run-finaliz
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../../vendor/paperclip-runner/testing.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
-import { PaperclipRunnerSemanticAuthority } from "./runner-semantic-authority.js";
 import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 
 const questionTime = new Date("2026-01-01T12:00:00Z");
@@ -79,10 +78,6 @@ describe("historical task questions", () => {
     const authority = new PaperclipRunnerToolAuthority(db, f);
     expect(await authority.execute({ tool: "get_task_context", callId: "context", arguments: {} }))
       .toMatchObject({ taskQuestionContext: { questions: [{ id: f.question.id, historical: true }], truncated: false } });
-    const semantic = new PaperclipRunnerSemanticAuthority(db, f);
-    expect(await semantic.dispatch({ callId: "context", operationId: "get_task_context", input: {},
-      correlation: { runId: f.runId, normalizedSessionId: randomUUID(), turnId: "turn", itemId: "item" } }))
-      .toMatchObject({ ok: true, value: { taskQuestionContext: { questions: [{ id: f.question.id, historical: true }] } } });
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.question.id)))
       .toEqual([expect.objectContaining({ status: "pending", result: null, resolvedAt: null, payload: f.question.payload })]);
   });
