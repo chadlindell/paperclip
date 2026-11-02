@@ -82,10 +82,9 @@ const generalServerWithoutChatOrNativeRunnerGroupName = "general-server-without-
 const generalChatGroupName = "general-chat";
 const generalServerNativeRunnerGroupName = "general-server-native-runner";
 const chatSuite = "server/src/__tests__/chat-channels.integration.test.ts";
-// The first suite rebuilds the Runner release binaries with cargo in beforeAll.
-// Inside the PR workflow's plain server shards, which carry no Rust cache,
-// that build was a ~4m30s cold compile of every third-party crate on each run
-// (277s of a 291s shard vitest step, actions run 35246999382, 2026-09-17).
+// These suites build or execute Runner binaries. Keep them in the Rust-cached
+// lane so ordinary server shards do not repeat a cold dependency build or skip
+// process coverage because fixture binaries are absent.
 const nativeRunnerSuites = [
   "server/src/services/native-runtime/plugin-runner-probe.test.ts",
   "server/src/__tests__/dot-runner.test.ts",

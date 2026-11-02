@@ -1221,7 +1221,7 @@
     "server/src/services/native-runtime/runner-api.test.ts": 821,
     "server/src/services/native-runtime/runner-bridge-tools.test.ts": 100,
     "server/src/services/native-runtime/runner-operation-timing.test.ts": 100,
-    "server/src/services/native-runtime/runner-prp-coordinator.test.ts": 1490,
+    "server/src/services/native-runtime/native-run-coordinator-store.test.ts": 1490,
     "server/src/services/native-runtime/runner-task-attachments.test.ts": 1967,
     "server/src/services/native-runtime/runner-tool-results.test.ts": 186,
     "server/src/services/native-runtime/runtime-asset-retention.test.ts": 100,
