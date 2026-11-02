@@ -5284,10 +5284,17 @@ it.each([
   label, args, terminal, disposition,
 }) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-stop-result-"));
+  const completionPath = join(stateDirectory, "completion.json");
+  if (label === "completed") await writeFile(completionPath, JSON.stringify({
+    schema: "paperclip.run_result.v1", reportedWorkDisposition: "done",
+    summary: "Completed the synthetic task and explicitly reported its result.",
+    completionClaim: { contractRevision: "1", objectiveSatisfied: true, criteria: [], remainingWork: [] },
+    evidence: [], verification: [], attentionRequests: [], artifacts: [],
+  }));
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
-    codexArgs: fakeCodexArgs(stateDirectory, ...args),
+    codexArgs: fakeCodexArgs(stateDirectory, ...args, ...(label === "completed" ? ["--terminal-result-file", completionPath] : [])),
     stateDirectory,
   });
   const driver = new CodexAppServerDriver({
@@ -6762,12 +6769,14 @@ it.each([
     };
     const within = async <T>(promise: Promise<T>, timeout = 5_000) => {
       let timer: NodeJS.Timeout | undefined;
+      // Retain the caller in a timeout stack so the failed lifecycle phase is visible.
+      const timedOut = new Error("warm restart fixture timed out");
       try {
         return await Promise.race([
           promise,
           new Promise<never>((_resolve, reject) => {
             timer = setTimeout(
-              () => reject(new Error("warm restart fixture timed out")),
+              () => reject(timedOut),
               timeout,
             );
           }),
@@ -8270,6 +8279,20 @@ it("still fails closed when a real close grace period cannot fit a durable suspe
 it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accounting-rejected"] as const)("cold-restores a suspended provider session under its durable run binding (pending tail: %s)", async (pendingTail) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-cold-attach-"));
   const tracePath = join(stateDirectory, "provider-trace.ndjson");
+  const completionPath = join(stateDirectory, "completion.json");
+  const completionReport = (epoch: string) => ({
+    schema: "paperclip.run_result.v1", reportedWorkDisposition: "done",
+    summary: `Completed the synthetic ${epoch} authority task.`,
+    completionClaim: { contractRevision: `contract-${epoch}`, objectiveSatisfied: true,
+      criteria: [{ criterionId: `criterion-${epoch}`, status: "satisfied", evidenceRefs: ["fixture:completion"] }], remainingWork: [] },
+    evidence: [{ ref: "fixture:completion" }], verification: [], attentionRequests: [], artifacts: [],
+  });
+  const acceptCompletion = (epoch: string) => async (request: { params: Record<string, unknown> }) => {
+    expect(request.params.tool).toBe("paperclip_finish");
+    expect(request.params.arguments).toEqual(completionReport(epoch));
+    return { success: true, contentItems: [] };
+  };
+  await writeFile(completionPath, JSON.stringify(completionReport("first")));
   const skillRoot = join(stateDirectory, "runtime-skill");
   const instructionRoot = join(stateDirectory, "runtime-instructions");
   await Promise.all([mkdir(skillRoot), mkdir(instructionRoot)]);
@@ -8290,6 +8313,7 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
       stateDirectory,
       "--include-skill-instructions",
       "--durable-turn-ids",
+      "--terminal-result-file", completionPath,
       "-c",
       'shell_environment_policy.set={PATH="/run/A"}',
     ),
@@ -8317,10 +8341,8 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
     ...options,
     prpIdentity: baseIdentity,
   });
-  first.transport.setServerRequestHandler(async () => ({
-    success: true,
-    contentItems: [],
-  }));
+  const firstCompletion = vi.fn(acceptCompletion("first"));
+  first.transport.setServerRequestHandler(firstCompletion);
   let firstProviderThread: { id: string; sessionId: string } | null = null;
   try {
     const started = await first.transport.request("thread/start", {
@@ -8356,6 +8378,8 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
   } finally {
     await first.transport.close();
   }
+  expect(firstCompletion).toHaveBeenCalledOnce();
+  await writeFile(completionPath, JSON.stringify(completionReport("second")));
   if (!firstProviderThread) {
     throw new Error("cold attach fixture did not return a provider thread");
   }
@@ -8432,7 +8456,7 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
     stagedCheckpoint!.restoreSessionDirectory(stateDirectory);
     rotated = createCapabilityRunnerdCodexTransport(rotatedOptions);
   }
-  const currentHandler = vi.fn(async () => ({ success: true, contentItems: [] }));
+  const currentHandler = vi.fn(acceptCompletion("second"));
   rotated.transport.setServerRequestHandler(currentHandler);
   if (pendingTail === "accounting-rejected") {
     const reading = rotated.transport.request("thread/read", {});
@@ -8462,7 +8486,8 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
       const retained = JSON.parse(await readFile(join(stateDirectory, "control-plane", "control-plane-state.json"), "utf8"));
       expect(retained.identity).toEqual(baseIdentity);
       expect(retained.stagedRunAttachment.targetIdentity).toEqual(secondIdentity);
-      expect(retained.commands.some((command: { type: string }) => ["run.attach", "semantic_tool.result"].includes(command.type))).toBe(false);
+      expect(retained.commands.some((command: { type: string; payload: { callId?: string } }) =>
+        command.type === "run.attach" || (command.type === "semantic_tool.result" && command.payload.callId === "unknown-source-call"))).toBe(false);
       expect(retained.committedEvents.some((event: PrpEvent) => event.eventType === "semantic_tool.input")).toBe(true);
     } finally {
       await expect(rotated.transport.close()).rejects.toMatchObject({ code: "native_session_close_unrecoverable" });
@@ -8505,8 +8530,11 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
       input: [{ type: "text", text: "$assigned second authority epoch" }, { type: "skill", name: "assigned", path: join(skillRoot, "SKILL.md") }],
     });
     for await (const event of rotated.transport.notifications()) {
-      if (event.method === "paperclip/runResult") break;
+      if (event.method === "turn/completed") break;
     }
+    expect(currentHandler).toHaveBeenCalledOnce();
+    const completedProvider = JSON.parse(await readFile(join(stateDirectory, "runner", "codex-provider-state.json"), "utf8"));
+    expect(completedProvider.activeProviderResultDisposition).toBe("done");
     expect(rotated.evidence().diagnostics).toContain(
       "runnerd attached the durable provider session to a fresh PRP run authority",
     );
@@ -8653,6 +8681,7 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
     stat(join(externallyOwnedRunnerStateDirectory, "runner-state.json")),
   ).rejects.toThrow();
 
+  await writeFile(completionPath, JSON.stringify(completionReport("external")));
   const externalRotationSteps: string[] = [];
   const externallyRotated = createCapabilityRunnerdCodexTransport({
     ...options,
@@ -8703,10 +8732,8 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
     resumeDynamicTools: dynamicTools,
     prpIdentity: externalIdentity,
   });
-  restored.transport.setServerRequestHandler(async () => ({
-    success: true,
-    contentItems: [],
-  }));
+  const externalCompletion = vi.fn(acceptCompletion("external"));
+  restored.transport.setServerRequestHandler(externalCompletion);
   try {
     const read = await restored.transport.request("thread/read", {});
     expect(read.thread).toMatchObject({
@@ -8741,6 +8768,7 @@ it.each([false, true, "restart-before-bootstrap", "unknown-semantic", "accountin
     for await (const event of restored.transport.notifications()) {
       if (event.method === "turn/completed") break;
     }
+    expect(externalCompletion).toHaveBeenCalledOnce();
     expect(restored.evidence()).toMatchObject({
       runnerExited: false,
       codexPid: expect.any(Number),
