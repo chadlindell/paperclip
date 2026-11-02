@@ -88,7 +88,6 @@ const chatSuite = "server/src/__tests__/chat-channels.integration.test.ts";
 // (277s of a 291s shard vitest step, actions run 35246999382, 2026-09-17).
 const nativeRunnerSuites = [
   "server/src/services/native-runtime/plugin-runner-probe.test.ts",
-  "server/src/services/native-runtime/native-codex-runner.integration.test.ts",
   "server/src/__tests__/dot-runner.test.ts",
   // These process cases otherwise skip in server shards without Runner binaries.
   "server/src/services/native-runtime/native-runner-restart-recovery.integration.test.ts",

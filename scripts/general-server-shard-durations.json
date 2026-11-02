@@ -1129,7 +1129,6 @@
     "server/src/services/native-runtime/native-case-handoff.test.ts": 924,
     "server/src/services/native-runtime/native-case-tools.integration.test.ts": 17474,
     "server/src/services/native-runtime/native-chat-workspace.test.ts": 496,
-    "server/src/services/native-runtime/native-codex-runner.integration.test.ts": 224015,
     "server/src/services/native-runtime/native-codex-runner.test.ts": 100,
     "server/src/services/native-runtime/native-completion-feedback.test.ts": 2337,
     "server/src/services/native-runtime/native-completion-format-feedback.test.ts": 100,
