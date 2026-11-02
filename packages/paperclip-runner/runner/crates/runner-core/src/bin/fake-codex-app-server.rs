@@ -321,7 +321,9 @@ fn emit_fixture_goal(state_path: &Path, state: &mut FakeState, status: &str) -> 
         let thread_id = state.thread_id.clone();
         thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !gate.is_file() && Instant::now() < deadline { thread::sleep(Duration::from_millis(1)); }
+            while !gate.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
             if gate.is_file() {
                 let _ = send(json!({"method": "thread/goal/updated", "params": {
                     "threadId": thread_id, "goal": goal, "workingNow": false}}));
@@ -1208,9 +1210,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             } else if !hold_turn {
                 if let Some(result) = &terminal_result {
-                    send(json!({ "id": "terminal-result-request", "method": "item/tool/call",
+                    send(
+                        json!({ "id": "terminal-result-request", "method": "item/tool/call",
                         "params": { "threadId": state.thread_id, "turnId": state.active_turn_id,
-                            "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result } }))?;
+                            "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result } }),
+                    )?;
                 } else {
                     finish_turn(&state_path, &mut state, "completed")?;
                 }
@@ -1384,12 +1388,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))?;
                     }
                 }
-                if args.iter().any(|arg| arg == "--replay-terminal-result-on-resume") {
-                    if let (Some(turn_id), Some(result)) = (state.active_turn_id.as_deref(), terminal_result.as_ref()) {
+                if args
+                    .iter()
+                    .any(|arg| arg == "--replay-terminal-result-on-resume")
+                {
+                    if let (Some(turn_id), Some(result)) =
+                        (state.active_turn_id.as_deref(), terminal_result.as_ref())
+                    {
                         if !(hold_first_durable_turn && state.next_turn == 1) {
-                            send(json!({"id": "terminal-result-request", "method": "item/tool/call",
+                            send(
+                                json!({"id": "terminal-result-request", "method": "item/tool/call",
                                 "params": {"threadId": state.thread_id, "turnId": turn_id,
-                                    "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result}}))?;
+                                    "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result}}),
+                            )?;
                         }
                     }
                 }
@@ -1907,7 +1918,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "version":1,"supersedeOnUserComment":false}
                         }}),
                     )?;
-                } else if let Some(result) = terminal_result.as_ref().filter(|_| !emit_tool_call && !hold_turn) {
+                } else if let Some(result) = terminal_result
+                    .as_ref()
+                    .filter(|_| !emit_tool_call && !hold_turn)
+                {
                     send(json!({
                         "id": "terminal-result-request", "method": "item/tool/call",
                         "params": { "threadId": state.thread_id, "turnId": provider_turn_id,

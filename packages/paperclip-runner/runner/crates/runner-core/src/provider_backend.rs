@@ -828,7 +828,13 @@ fn terminal_events(
             Some("blocked") => "blocked",
             Some("paused" | "limited" | "usage_limited" | "budget_limited") => "yielded",
             Some("complete") => "done",
-            _ => if succeeded { "done" } else { "needs_review" },
+            _ => {
+                if succeeded {
+                    "done"
+                } else {
+                    "needs_review"
+                }
+            }
         });
     let provider = state.config.provider.as_str();
     let provider_name = if provider == "opencode" {
@@ -5782,53 +5788,78 @@ mod tests {
     #[test]
     fn unreported_commentary_after_listing_cannot_satisfy_the_task_contract() {
         let mut state = declared_finish_state();
-        let commands = normalize_provider_notification(&mut state, "item/completed", &json!({
-            "threadId": "thread-1", "turnId": "turn-1", "item": {
-                "id": "listing", "type": "commandExecution", "command": "ls -la",
-                "cwd": "/synthetic/workspace", "status": "completed", "exitCode": 0,
-                "aggregatedOutput": "contract.json\nqualification_task.py\n"
-            }
-        })).unwrap();
-        assert!(commands.iter().any(|event| event.event_type == "tool.execution.completed"));
+        let commands = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1", "item": {
+                    "id": "listing", "type": "commandExecution", "command": "ls -la",
+                    "cwd": "/synthetic/workspace", "status": "completed", "exitCode": 0,
+                    "aggregatedOutput": "contract.json\nqualification_task.py\n"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(commands
+            .iter()
+            .any(|event| event.event_type == "tool.execution.completed"));
         state.last_agent_message = Some("I need to run the specified fixture command `python3 qualification_task.py productive` as instructed. Let me first check what this script contains to understand what it does.".to_owned());
         assert!(state.active_provider_result_fingerprint.is_none());
         let events = terminal_events(&state, "turn.completed", None);
-        assert!(events.iter().all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
-        assert!(events.iter().all(|event| event.payload["reportedWorkDisposition"] != "done"));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["reportedWorkDisposition"] != "done"));
         assert_eq!(events[0].event_type, "session.failed");
         assert_eq!(events[0].payload["code"], "semantic_completion_missing");
         assert_eq!(events[0].payload["recoverable"], false);
         assert_eq!(events[1].event_type, "run.terminal");
         assert_eq!(events[1].payload["runTerminalState"], "failed");
-        assert!(events.iter().all(|event| event.event_type != "run.result.proposed"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
     }
 
     #[test]
     fn unreported_provider_goal_completion_cannot_satisfy_the_task_contract() {
         let state = declared_finish_state();
         let events = terminal_events(&state, "turn.completed", Some("complete"));
-        assert!(events.iter().all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
-        assert!(events.iter().all(|event| event.payload["reportedWorkDisposition"] != "done"));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["reportedWorkDisposition"] != "done"));
         assert_eq!(events[0].event_type, "session.failed");
         assert_eq!(events[0].payload["code"], "semantic_completion_missing");
         assert_eq!(events[0].payload["recoverable"], false);
         assert_eq!(events[1].event_type, "run.terminal");
         assert_eq!(events[1].payload["runTerminalState"], "failed");
-        assert!(events.iter().all(|event| event.event_type != "run.result.proposed"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
     }
 
     #[test]
     fn unreported_empty_turn_cannot_satisfy_the_task_contract() {
         let state = declared_finish_state();
         let events = terminal_events(&state, "turn.completed", None);
-        assert!(events.iter().all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
-        assert!(events.iter().all(|event| event.payload["reportedWorkDisposition"] != "done"));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["reportedWorkDisposition"] != "done"));
         assert_eq!(events[0].event_type, "session.failed");
         assert_eq!(events[0].payload["code"], "semantic_completion_missing");
         assert_eq!(events[0].payload["recoverable"], false);
         assert_eq!(events[1].event_type, "run.terminal");
         assert_eq!(events[1].payload["runTerminalState"], "failed");
-        assert!(events.iter().all(|event| event.event_type != "run.result.proposed"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
     }
 
     #[test]
@@ -5839,7 +5870,9 @@ mod tests {
         assert_eq!(events[0].event_type, "session.failed");
         assert_eq!(events[0].payload["code"], "semantic_completion_missing");
         assert_eq!(events[1].payload["runTerminalState"], "failed");
-        assert!(events.iter().all(|event| event.event_type != "run.result.proposed"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
         assert!(terminal_events(&state, "turn.completed", Some("active")).is_empty());
         assert!(state.validate().is_ok());
     }

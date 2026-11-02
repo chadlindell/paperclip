@@ -1607,7 +1607,9 @@ fn executes_opencode_through_the_local_facade_without_codex_event_labels() {
         .expect("OpenCode must reject missing completion authority");
     assert_eq!(failure.payload["code"], "semantic_completion_missing");
     assert_eq!(failure.payload["provider"], "opencode");
-    assert!(!observed.iter().any(|event| event.event_type == "run.result.proposed"));
+    assert!(!observed
+        .iter()
+        .any(|event| event.event_type == "run.result.proposed"));
     assert!(observed.iter().any(|event| {
         event.event_type == "item.completed" && event.payload["provider"] == "opencode"
     }));

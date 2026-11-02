@@ -6180,7 +6180,11 @@ fn structured_question_round_trips_through_the_normalized_backend() {
 #[test]
 fn codex_completion_requires_an_accepted_bound_result() {
     for accepted_report in [false, true] {
-        let directory = temporary_directory(if accepted_report { "accepted-completion-contract" } else { "missing-completion-contract" });
+        let directory = temporary_directory(if accepted_report {
+            "accepted-completion-contract"
+        } else {
+            "missing-completion-contract"
+        });
         let input = json!({
             "schema": "paperclip.run_result.v1", "reportedWorkDisposition": "done", "summary": "Executed the synthetic task.",
             "completionClaim": { "contractRevision": "sha256:test-contract", "objectiveSatisfied": true,
@@ -6191,16 +6195,41 @@ fn codex_completion_requires_an_accepted_bound_result() {
         let input_path = directory.join("finish-input.json");
         fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
         let mut config = provider_config(&directory, &[]);
-        if accepted_report { config.args.extend(["--terminal-result-file".to_owned(), input_path.to_string_lossy().into_owned()]); }
-        let operation = AuthorizedTool { operation_id: "paperclip_finish".to_owned(), version: 1,
-            description: "Report completed work.".to_owned(), input_schema: json!({"type": "object"}), response_schema: json!({"type": "object"}) };
-        let authorized = AuthorizedToolSet { schema: TOOL_SET_SCHEMA.to_owned(), schema_version: 1,
-            catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation)).unwrap(), operations: vec![operation] };
-        let mut executor = CodexCommandExecutor::with_runner_config(&directory, &durable_config(&directory));
+        if accepted_report {
+            config.args.extend([
+                "--terminal-result-file".to_owned(),
+                input_path.to_string_lossy().into_owned(),
+            ]);
+        }
+        let operation = AuthorizedTool {
+            operation_id: "paperclip_finish".to_owned(),
+            version: 1,
+            description: "Report completed work.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let authorized = AuthorizedToolSet {
+            schema: TOOL_SET_SCHEMA.to_owned(),
+            schema_version: 1,
+            catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                .unwrap(),
+            operations: vec![operation],
+        };
+        let mut executor =
+            CodexCommandExecutor::with_runner_config(&directory, &durable_config(&directory));
         executor.execute(&command("prepare", 1, "run.prepare", json!({"provider": config, "authorizedTools": authorized,
             "completionContract": {"revision": "sha256:test-contract", "criterionIds": ["criterion_test_task"]}}))).unwrap();
-        executor.execute(&command("open", 2, "session.open", json!({}))).unwrap();
-        executor.execute(&command("turn", 3, "turn.start", json!({"text": "Complete the synthetic task and report its result."}))).unwrap();
+        executor
+            .execute(&command("open", 2, "session.open", json!({})))
+            .unwrap();
+        executor
+            .execute(&command(
+                "turn",
+                3,
+                "turn.start",
+                json!({"text": "Complete the synthetic task and report its result."}),
+            ))
+            .unwrap();
         let mut emitted = Vec::new();
         let mut inputs = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -6216,26 +6245,49 @@ fn codex_completion_requires_an_accepted_bound_result() {
                 }
             }
             emitted.extend(events);
-            if emitted.iter().any(|event| event.event_type == "run.terminal") { break; }
+            if emitted
+                .iter()
+                .any(|event| event.event_type == "run.terminal")
+            {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let terminal = emitted.iter().position(|event| event.event_type == "run.terminal").unwrap();
+        let terminal = emitted
+            .iter()
+            .position(|event| event.event_type == "run.terminal")
+            .unwrap();
         if accepted_report {
             // The controller commits the accepted semantic result before its
             // response; the provider records that authority, not a second proposal.
-            assert!(!emitted.iter().any(|event| event.event_type == "run.result.proposed"));
+            assert!(!emitted
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
             assert_eq!(emitted[terminal].payload["runTerminalState"], "succeeded");
             assert_eq!(emitted[terminal].payload["reportedWorkDisposition"], "done");
-            assert!(!emitted.iter().any(|event| event.event_type == "session.failed"));
+            assert!(!emitted
+                .iter()
+                .any(|event| event.event_type == "session.failed"));
             assert_eq!(inputs, 1);
             assert_eq!(call_count(&directory, "terminal-result:accepted"), 1);
         } else {
-            let failure = emitted.iter().position(|event| event.event_type == "session.failed").unwrap();
-            let turn = emitted.iter().position(|event| event.event_type == "turn.completed").unwrap();
+            let failure = emitted
+                .iter()
+                .position(|event| event.event_type == "session.failed")
+                .unwrap();
+            let turn = emitted
+                .iter()
+                .position(|event| event.event_type == "turn.completed")
+                .unwrap();
             assert!(failure < turn && turn < terminal);
-            assert_eq!(emitted[failure].payload["code"], "semantic_completion_missing");
+            assert_eq!(
+                emitted[failure].payload["code"],
+                "semantic_completion_missing"
+            );
             assert_eq!(emitted[terminal].payload["runTerminalState"], "failed");
-            assert!(!emitted.iter().any(|event| event.event_type == "run.result.proposed"));
+            assert!(!emitted
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
             assert_eq!(inputs, 0);
         }
         executor.shutdown().unwrap();
