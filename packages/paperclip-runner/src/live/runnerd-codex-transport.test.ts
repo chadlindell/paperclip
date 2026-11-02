@@ -6801,6 +6801,7 @@ it.each([
       stateDirectory,
       lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
       runnerReconnectGraceMs: 2_000,
+      closeGraceMs: 1_000,
       prpIdentity: (() => {
         const runId = randomUUID();
         return {
@@ -6992,7 +6993,17 @@ it.each([
       });
       void attachment.catch(() => undefined);
       await within(loss);
-      await within(detached!);
+      const retirementFailure = await within(detached!.then(() => null, error => error));
+      if (retirementFailure !== null) {
+        const failures = retirementFailure instanceof AggregateError
+          ? retirementFailure.errors : [retirementFailure];
+        for (const failure of failures) expect(String(failure)).toMatch(
+          /fixture controller persistence unavailable after loss|Controller (?:startup drain|route release|ingress stop|journal drain) timed out/,
+        );
+      }
+      // The fixture models permanent controller storage loss. A failed detach
+      // is not takeover authority: join the exact owned processes below before
+      // restoring their retained checkpoint into a replacement controller.
       expect(lossObserved).toBe(true);
       const runnerPath = join(stateDirectory, "runner/runner-state.json");
       const runner = JSON.parse(await readFile(runnerPath, "utf8"));
