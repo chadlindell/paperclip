@@ -61,6 +61,11 @@ pub(crate) fn runtime_notification_codex_args(
         let Some(filesystem) = config["filesystem"].as_inline_table_mut() else {
             continue;
         };
+        // Preserve the private IPC root's metadata in the sandbox view. It
+        // contains only the read-only lock and the disposable writable channel.
+        if let Some(parent) = paths[3].parent() {
+            filesystem.insert(parent.to_string_lossy().as_ref(), "read".into());
+        }
         for (path, mode) in paths.iter().zip(["read", "read", "read", "write"]) {
             filesystem.insert(path.to_string_lossy().as_ref(), mode.into());
         }
@@ -4288,7 +4293,7 @@ mod tests {
             PathBuf::from("/runtime/runnerd"),
             PathBuf::from("/state/private/runtime-notifications.json"),
             PathBuf::from("/state/private/runtime-activity.lock"),
-            PathBuf::from("/tmp/prn-channel"),
+            PathBuf::from("/tmp/prn-channel/ipc"),
         ];
         let extra =
             runtime_notification_codex_args(&args, "paperclip-runner-workspace-only", &paths);
@@ -4328,7 +4333,8 @@ mod tests {
                 ("/runtime/runnerd", "read"),
                 ("/state/private/runtime-notifications.json", "read"),
                 ("/state/private/runtime-activity.lock", "read"),
-                ("/tmp/prn-channel", "write"),
+                ("/tmp/prn-channel", "read"),
+                ("/tmp/prn-channel/ipc", "write"),
             ] {
                 assert_eq!(
                     filesystem.get(path).and_then(toml_edit::Value::as_str),

@@ -1600,14 +1600,16 @@ fn executes_opencode_through_the_local_facade_without_codex_event_labels() {
         .find(|event| event.event_type == "run.terminal")
         .expect("OpenCode run must become terminal");
     assert_eq!(terminal.payload["provider"], "opencode");
-    let result = observed
+    assert_eq!(terminal.payload["runTerminalState"], "failed");
+    let failure = observed
         .iter()
-        .find(|event| event.event_type == "run.result.proposed")
-        .expect("OpenCode terminal fallback must propose a result");
-    assert_eq!(
-        result.payload["evidence"][0]["ref"],
-        "provider:opencode:agent-message"
-    );
+        .find(|event| event.event_type == "session.failed")
+        .expect("OpenCode must reject missing completion authority");
+    assert_eq!(failure.payload["code"], "semantic_completion_missing");
+    assert_eq!(failure.payload["provider"], "opencode");
+    assert!(!observed
+        .iter()
+        .any(|event| event.event_type == "run.result.proposed"));
     assert!(observed.iter().any(|event| {
         event.event_type == "item.completed" && event.payload["provider"] == "opencode"
     }));

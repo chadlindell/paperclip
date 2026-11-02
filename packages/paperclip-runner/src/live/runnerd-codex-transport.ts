@@ -3628,6 +3628,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #probeRetirement: Promise<void> | null = null;
   readonly prepareConversationResume?: CodexAppServerTransport["prepareConversationResume"];
   #detachPromise: Promise<void> | null = null;
+  #controllerCleanupFailure: Error | null = null;
   #startupOperation: Promise<unknown> | null = null;
   #attachmentOperation: Promise<void> | null = null;
   #startupDrainTimedOut = false;
@@ -3796,7 +3797,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    if (this.#closed) throw new Error("PRP Codex transport is closed");
+    if (this.#closed || this.#controllerDetachedForRestart) throw new Error("PRP Codex transport is closed");
     this.#throwIfFailed();
     if (this.#sourceRecoveryIdentity && !["initialize", "collaborationMode/list"].includes(method)) {
       throw new Error("native_runner_source_attachment_pending");
@@ -4304,6 +4305,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           : Math.min(Date.now() + 30_000, this.#sourceAttachmentDeadline),
         true,
       );
+      this.#assertStartupOpen();
       const attached = core.getCommand(commandId);
       if (attached?.status !== "completed") {
         throw new Error("native_runner_prp_run_rotation_failed");
@@ -4320,12 +4322,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           const proof = inspectWarmRunTransition({ controlPlaneState: core.store.state, runnerState: physical,
             expectedNewIdentity: desired, expectedRunnerVersion: artifact.version, expectedRunnerDigest: artifact.digest });
           if (proof && recoveryIdentityMatches(proof.runnerIdentity, desired)) {
-            await previousRelease?.(); previousReleased = true; break;
+            await previousRelease?.(this.#controllerDetachedForRestart ? "detach" : undefined); previousReleased = true; break;
           }
           if (Date.now() >= deadline || await this.#runnerHasExited()) throw new Error("native_runner_warm_transition_activation_pending");
           await new Promise<void>(done => setTimeout(done, 100));
         }
       }
+      this.#assertStartupOpen();
       await registration?.activate?.();
       if (registration?.failure) {
         void registration.failure.catch((error: unknown) => {
@@ -4356,8 +4359,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#eventSourceSeq = 0;
       this.#deferredTurnStartEvents = [];
       this.#durableTurnId = desired.turnId;
-      if (!previousReleased) await previousRelease?.();
+      if (!previousReleased) await previousRelease?.(this.#controllerDetachedForRestart ? "detach" : undefined);
       previousReleased = true;
+      this.#assertStartupOpen();
       this.#controlPlaneRelease = registration?.release ?? null;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
@@ -4366,16 +4370,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // Keep the prior release owned by close until its handoff is confirmed.
       if (!this.#closed) this.#controlPlaneRelease = previousReleased ? null : previousRelease;
       await Promise.resolve()
-        .then(() => registration?.release())
-        .catch(() => undefined);
+        .then(() => registration?.release(this.#controllerDetachedForRestart ? "detach" : undefined))
+        .catch((error: unknown) => {
+          this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+        });
       if (activationStarted) {
         // Once the completed handoff is exposed, an activation failure makes
         // both routes unavailable; neither remains an ordinary-work owner.
         this.#controlPlaneRelease = null;
         if (!previousReleased) {
           await Promise.resolve()
-            .then(() => previousRelease?.())
-            .catch(() => undefined);
+            .then(() => previousRelease?.(this.#controllerDetachedForRestart ? "detach" : undefined))
+            .catch((error: unknown) => {
+              this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+            });
         }
         this.#failTransport(failure);
       }
@@ -4662,33 +4670,75 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return this.#detachPromise;
   }
 
-  async #stopAndDrainAuthority(deadline: number): Promise<void> {
-    const core = this.#core;
-    if (!core) return;
-    await core.stop();
+  async #withinRetirementDeadline<T>(work: () => Promise<T> | T, deadline: number, phase: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        core.drainPendingConnectionProcessing(),
+      return await Promise.race([
+        Promise.resolve().then(work),
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => reject(new Error(
-            "Controller journal drain timed out; preserve the session before replacing its writer.",
+            `Controller ${phase} timed out; preserve the session before replacing its writer.`,
           )), Math.max(0, deadline - Date.now()));
         }),
       ]);
-    } finally {
-      clearTimeout(timer);
-    }
+    } finally { clearTimeout(timer); }
+  }
+
+  #throwRetirementFailures(failures: unknown[]): void {
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures,
+      failures.map(error => error instanceof Error ? error.message : String(error)).join("; "),
+      { cause: failures[0] });
+  }
+
+  async #stopAndDrainAuthority(deadline: number): Promise<void> {
+    const core = this.#core;
+    if (!core) return;
+    core.fenceSemanticToolCallbacks();
+    const failures: unknown[] = [];
+    try { await this.#withinRetirementDeadline(() => core.stop(), deadline, "ingress stop"); }
+    catch (error) { failures.push(error); }
+    try { await this.#withinRetirementDeadline(() => core.drainPendingConnectionProcessing(), deadline, "journal drain"); }
+    catch (error) { failures.push(error); }
+    this.#throwRetirementFailures(failures);
+    core.retireSemanticToolCallbacks();
   }
 
   async #detachControllerOnce(): Promise<void> {
-    if (this.#closed) return;
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
+    const closing = this.#closePromise;
+    if (closing !== null) {
+      // Close already owns process settlement. Do not redirect it back to this
+      // detach promise or reinterpret a failed close as retirement proof.
+      await this.#withinRetirementDeadline(() => closing, deadline, "close drain");
+      if (this.#controllerCleanupFailure) throw this.#controllerCleanupFailure;
+      return;
+    }
+    if (this.#closed) throw new Error("Controller retirement is unconfirmed");
+    const admitted = [this.#startupOperation, this.#attachmentOperation];
     this.#controllerDetachedForRestart = true;
+    this.#core?.fenceSemanticToolCallbacks();
     this.#closed = true;
     this.#resolveClosedSignal();
     this.#turnStartAdmission?.resolve(false);
-    await this.#retireControllerForRecovery(deadline);
+    // Fencing makes waiter release safe. A successful takeover also requires
+    // admitted work and every owned ingress/persistence cleanup to settle.
+    const failures: unknown[] = [];
+    try {
+      try {
+        await this.#withinRetirementDeadline(() => Promise.allSettled(admitted), deadline, "startup drain");
+      } catch (error) {
+        this.#startupDrainTimedOut = true;
+        failures.push(error);
+      }
+      if (this.#controllerCleanupFailure) failures.push(this.#controllerCleanupFailure);
+      this.#core?.fenceSemanticToolCallbacks();
+      // A timed-out join still owes cleanup, but cleanup success never erases
+      // the failed join or grants permission to replace its retained writer.
+      try { await this.#retireControllerForRecovery(deadline); }
+      catch (error) { failures.push(error); }
+      this.#throwRetirementFailures(failures);
+    } finally { this.#queue.close(); }
     this.#handle = null;
     this.#diagnostic(
       "controller authority detached for restart; durable runner left alive",
@@ -4704,16 +4754,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#core?.disconnectActiveRunner();
     const release = this.#controlPlaneRelease;
     this.#controlPlaneRelease = null;
-    await Promise.resolve(release?.("detach")).catch((error: unknown) => {
-      this.#diagnostic(
-        `controller route release failed during retirement: ${String(error)}`,
-      );
-    });
+    const failures: unknown[] = [];
     try {
-      await this.#stopAndDrainAuthority(deadline);
-    } finally {
-      this.#queue.close();
-    }
+      try { await this.#withinRetirementDeadline(() => release?.("detach"), deadline, "route release"); }
+      catch (error) { failures.push(error); }
+      try { await this.#stopAndDrainAuthority(deadline); }
+      catch (error) { failures.push(error); }
+      this.#throwRetirementFailures(failures);
+    } finally { this.#queue.close(); }
   }
 
   #trackStartup<T>(start: () => Promise<T>): Promise<T> {
@@ -4729,13 +4777,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   #assertStartupOpen(): void {
-    if (this.#closed) throw new Error("runnerd transport closed during provider startup");
+    if (this.#closed || this.#controllerDetachedForRestart) throw new Error("runnerd transport closed during provider startup");
   }
 
   async #closeOnce(): Promise<void> {
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
     try {
       await this.#closeAndSettle();
+      if (this.#controllerCleanupFailure) throw this.#controllerCleanupFailure;
     } catch (error) {
       this.#queue.close();
       try { await this.#retireControllerForRecovery(deadline); }
@@ -5327,7 +5376,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#closed && this.#startupDrainTimedOut) {
       const release = this.#controlPlaneRelease;
       this.#controlPlaneRelease = null;
-      await release?.();
+      await Promise.resolve()
+        .then(() => release?.(this.#controllerDetachedForRestart ? "detach" : undefined))
+        .catch((error: unknown) => {
+          this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+          throw error;
+        });
     }
     this.#assertStartupOpen();
     const admissionDeadline = this.#coldAdmissionDeadline();
@@ -6005,7 +6059,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           throw new Error("native_runner_warm_transition_registered_endpoint_mismatch");
         }
       } catch (error) {
-        await Promise.allSettled([oldTransitionRegistration, newTransitionRegistration].map(entry => Promise.resolve().then(() => entry?.release())));
+        const releases = await Promise.allSettled([oldTransitionRegistration, newTransitionRegistration]
+          .map(entry => Promise.resolve().then(() => entry?.release(this.#controllerDetachedForRestart ? "detach" : undefined))));
+        for (const result of releases) {
+          if (result.status === "rejected") {
+            this.#controllerCleanupFailure ??= result.reason instanceof Error ? result.reason : new Error(String(result.reason));
+          }
+        }
         throw error;
       }
     }
@@ -6030,18 +6090,26 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#controlPlaneCheckpoint = registration.checkpoint ?? null;
       this.#controlPlaneRelease =
         oldTransitionRegistration && newTransitionRegistration
-          ? async () => {
-              await Promise.all([
-                oldTransitionRegistration!.release(),
-                newTransitionRegistration!.release(),
-              ]);
+          ? async (reason) => {
+              const releases = await Promise.allSettled([oldTransitionRegistration!, newTransitionRegistration!]
+                .map(entry => Promise.resolve().then(() => entry.release(reason))));
+              const failures = releases.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+              if (failures.length > 0) {
+                this.#controllerCleanupFailure ??= failures[0] instanceof Error ? failures[0] : new Error(String(failures[0]));
+              }
+              this.#throwRetirementFailures(failures);
             }
           : registration.release;
     }
     if (this.#closed && this.#startupDrainTimedOut) {
       const release = this.#controlPlaneRelease;
       this.#controlPlaneRelease = null;
-      await release?.();
+      await Promise.resolve()
+        .then(() => release?.(this.#controllerDetachedForRestart ? "detach" : undefined))
+        .catch((error: unknown) => {
+          this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+          throw error;
+        });
     }
     this.#assertStartupOpen();
     // Route and immutable endpoint admission precedes every launch-material
@@ -6194,13 +6262,21 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           && newTransitionRegistration && this.options.readRunnerState && Date.now() >= nextPhysicalInspection) {
           nextPhysicalInspection = Date.now() + 250;
           const physical = await this.options.readRunnerState();
+          this.#assertStartupOpen();
           const proof = inspectWarmRunTransition({ controlPlaneState: core.store.state, runnerState: physical,
             expectedNewIdentity: recoveryTarget!, expectedRunnerVersion: runnerArtifact.version, expectedRunnerDigest: runnerArtifact.digest });
           if (proof && recoveryIdentityMatches(proof.runnerIdentity, recoveryTarget!)) {
             // The same participant has consumed the old ACK and now serves
             // the target path. Stop obsolete ingress retries before they can
             // compete with the target's authenticated connection.
-            await oldTransitionRegistration.release(); sourceRouteRetired = true;
+            await Promise.resolve()
+              .then(() => oldTransitionRegistration!.release(this.#controllerDetachedForRestart ? "detach" : undefined))
+              .catch((error: unknown) => {
+                this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+                throw error;
+              });
+            sourceRouteRetired = true;
+            this.#assertStartupOpen();
             if (!targetRecoveryActivated) { await newTransitionRegistration.activate?.(); targetRecoveryActivated = true; }
           }
         }
@@ -6218,7 +6294,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#eventSourceSeq = 0;
       this.#deferredTurnStartEvents = [];
       if (oldTransitionRegistration && newTransitionRegistration) {
-        await oldTransitionRegistration.release();
+        await Promise.resolve()
+          .then(() => oldTransitionRegistration!.release(this.#controllerDetachedForRestart ? "detach" : undefined))
+          .catch((error: unknown) => {
+            this.#controllerCleanupFailure ??= error instanceof Error ? error : new Error(String(error));
+            throw error;
+          });
         this.#assertStartupOpen();
         this.#controlPlaneRelease = newTransitionRegistration.release;
         this.#controlPlaneCheckpoint = newTransitionRegistration.checkpoint ?? null;
@@ -6310,7 +6391,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new SemanticToolNotDispatchedError();
     }
     const core = this.#core;
-    const threadId = this.#threadId;
+    const expectedThreadId = this.#threadId;
     const epoch = this.#turnStartResponseEpoch;
     const admission = this.#turnStartAdmission;
     // This callback runs independently of the notification pump. Do not copy
@@ -6339,9 +6420,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     } catch {
       throw new SemanticToolNotDispatchedError();
     }
+    // An adopted Runner can deliver a queued input before its authenticated
+    // provider identity is reconstructed. Bind that initially empty identity
+    // only after completed startup and handler publication; an existing thread
+    // binding must still match exactly.
+    const threadId = expectedThreadId || this.#threadId;
     if (
       !accepted ||
       this.#closed ||
+      this.#controllerDetachedForRestart ||
+      !threadId ||
+      (!expectedThreadId && !this.#startupComplete) ||
       epoch !== this.#turnStartResponseEpoch ||
       threadId !== this.#threadId ||
       core === null ||
@@ -6563,6 +6652,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     payload: Record<string, unknown>,
     correlationId?: string,
   ): Promise<void> {
+    if (this.#controllerDetachedForRestart) throw new Error("PRP Codex transport is closed");
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
     const commandId = correlationId
@@ -6596,6 +6686,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     deadline?: number,
     abortOnClose = false,
   ): Promise<Record<string, unknown>> {
+    if (this.#controllerDetachedForRestart) throw new Error("PRP Codex transport is closed");
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
     const commandId = `command_lab_${randomUUID().replaceAll("-", "")}`;

@@ -319,7 +319,7 @@ test("the real serialized shard partition is complete, non-overlapping and durat
 
 const chatSuitePath = "server/src/__tests__/chat-channels.integration.test.ts";
 const nativeRunnerSuitePath =
-  "server/src/services/native-runtime/native-codex-runner.integration.test.ts";
+  "server/src/services/native-runtime/plugin-runner-probe.test.ts";
 const usageDeliverySuitePath = "server/src/services/native-runtime/native-usage-delivery.integration.test.ts";
 const dotRunnerSuitePath = "server/src/__tests__/dot-runner.test.ts";
 const restartRecoverySuitePath =
@@ -348,7 +348,7 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   // exclude them here.
   const chat = "server/src/__tests__/chat-channels.integration.test.ts";
   const nativeRunner =
-    "server/src/services/native-runtime/native-codex-runner.integration.test.ts";
+    "server/src/services/native-runtime/plugin-runner-probe.test.ts";
   const heaviest = Math.max(
     ...Object.entries(durations)
       .filter(([file]) => file !== chat && file !== nativeRunner)
@@ -365,7 +365,7 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   assert.ok(!files.includes(dotRunnerSuitePath));
   assert.ok(!files.includes(restartRecoverySuitePath));
   assert.ok(!files.includes(usageDeliverySuitePath));
-  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath, usageDeliverySuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
+  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath, usageDeliverySuitePath].sort(), full.selectedGeneralServerSuites.sort());
   assert.equal(new Set(files).size, files.length);
   const defaultRun = dryRunJson([], prEnv);
   assert.ok(defaultRun.generalServerSuiteCount === full.generalServerSuiteCount);
@@ -411,7 +411,6 @@ test("the native-runner lane runs exactly the cargo-dependent suites", () => {
   const lane = dryRunJson(["--mode", "general", "--group", "general-server-native-runner"]);
   assert.deepEqual(lane.selectedGeneralServerSuites, [
     "server/src/services/native-runtime/plugin-runner-probe.test.ts",
-    "server/src/services/native-runtime/native-codex-runner.integration.test.ts",
     dotRunnerSuitePath,
     restartRecoverySuitePath,
     usageDeliverySuitePath,

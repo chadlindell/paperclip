@@ -1,8 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { resolve } from "node:path";
 
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -29,13 +25,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
-import {
-  runnerPrpWebSocketInternals,
-  setupRunnerPrpWebSocketServer,
-} from "../../realtime/runner-prp-ws.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
-import { runnerPrpCoordinator } from "./runner-prp-coordinator.js";
-import { PaperclipRunnerSemanticAuthority } from "./runner-semantic-authority.js";
 import { nativeSha256 } from "./canonical.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -45,7 +35,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
-    `Skipping runner coordinator tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+    `Skipping native run store tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
 
@@ -102,22 +92,20 @@ function runnerEvent(seed: SeededNativeRun, sourceSeq = 1): PrpEvent {
   };
 }
 
-describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
+describeEmbeddedPostgres("native run coordinator store", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
     ReturnType<typeof startEmbeddedPostgresTestDatabase>
   > | null = null;
-  const scratchDirectories: string[] = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase(
-      "paperclip-runner-coordinator-",
+      "paperclip-native-run-store-",
     );
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
   afterEach(async () => {
-    runnerPrpWebSocketInternals.resetForTests();
     await db.delete(nativeRunFinalizations);
     await db.delete(nativeRunResults);
     await db.delete(heartbeatRunEvents);
@@ -127,9 +115,6 @@ describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
-    for (const directory of scratchDirectories.splice(0)) {
-      rmSync(directory, { recursive: true, force: true });
-    }
   });
 
   afterAll(async () => {
@@ -232,113 +217,6 @@ describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
       completionContractCriterionIds: [],
     });
   }
-
-  it("registers only an exact Codex native binding and exposes read-only tools", async () => {
-    const seed = await seedNativeRun();
-    const server = createServer();
-    setupRunnerPrpWebSocketServer(server, { apiUrl: "http://127.0.0.1:3213" });
-    const stateRoot = mkdtempSync(resolve(tmpdir(), "paperclip-runner-state-"));
-    scratchDirectories.push(stateRoot);
-    const coordinator = runnerPrpCoordinator(db, { stateRoot });
-    await expect(
-      coordinator.prepare({
-        ...seed,
-        companyId: randomUUID(),
-        normalizedSessionId: seed.sessionId,
-        environmentLeaseId: "environment-lease-1",
-        turnId: "turn-1",
-        itemId: "item-1",
-        runnerVersion: "0.3.0",
-        runnerDigest: `sha256:${"a".repeat(64)}`,
-      }),
-    ).rejects.toThrow("runner_prp_run_not_authorized");
-    const prepared = await coordinator.prepare({
-      ...seed,
-      normalizedSessionId: seed.sessionId,
-      environmentLeaseId: "environment-lease-1",
-      turnId: "turn-1",
-      itemId: "item-1",
-      runnerVersion: "0.3.0",
-      runnerDigest: `sha256:${"a".repeat(64)}`,
-    });
-
-    expect(prepared.connectUrl).toBe(
-      `ws://127.0.0.1:3213/api/runner/v1/connect/${seed.runId}`,
-    );
-    expect(prepared.bootstrapTicket).toMatch(/^bootstrap_/);
-    expect(prepared.semanticTools.map((tool) => tool.name)).toEqual([
-      "get_task_context",
-      "get_task_history",
-      "list_documents",
-      "read_document",
-      "list_document_revisions",
-    ]);
-    expect(
-      runnerPrpWebSocketInternals.activeRegistration({
-        companyId: seed.companyId,
-        runId: seed.runId,
-      }),
-    ).toBe(true);
-    await expect(
-      coordinator.prepare({
-        ...seed,
-        normalizedSessionId: seed.sessionId,
-        environmentLeaseId: "environment-lease-1",
-        turnId: "turn-1",
-        itemId: "item-1",
-        runnerVersion: "0.3.0",
-        runnerDigest: `sha256:${"a".repeat(64)}`,
-      }),
-    ).rejects.toThrow("runner_prp_authority_already_registered");
-    await prepared.release();
-    expect(
-      runnerPrpWebSocketInternals.activeRegistration({
-        companyId: seed.companyId,
-        runId: seed.runId,
-      }),
-    ).toBe(false);
-    server.close();
-  });
-
-  it("rechecks task ownership and returns semantic receipts", async () => {
-    const seed = await seedNativeRun();
-    const authority = new PaperclipRunnerSemanticAuthority(db, {
-      companyId: seed.companyId,
-      issueId: seed.issueId,
-      runId: seed.runId,
-      agentId: seed.agentId,
-    });
-    const call = {
-      callId: "call-1",
-      operationId: "get_task_context",
-      correlation: {
-        runId: seed.runId,
-        normalizedSessionId: seed.sessionId,
-        turnId: "turn-1",
-        itemId: "item-1",
-      },
-      input: {},
-    };
-    const allowed = await authority.dispatch(call);
-    expect(allowed).toMatchObject({
-      ok: true,
-      operationId: "get_task_context",
-      value: { activeTask: { id: seed.issueId }, run: { id: seed.runId } },
-      inputReceipt: { phase: "input" },
-      resultReceipt: { phase: "result" },
-    });
-
-    await db
-      .update(issues)
-      .set({ assigneeAgentId: null })
-      .where(eq(issues.id, seed.issueId));
-    const denied = await authority.dispatch({ ...call, callId: "call-2" });
-    expect(denied).toMatchObject({
-      ok: false,
-      error: { code: "task_ownership_denied", retryable: false },
-      resultReceipt: { phase: "result" },
-    });
-  });
 
   it("persists NUL-containing command output without changing replay identity", async () => {
     const seed = await seedNativeRun();

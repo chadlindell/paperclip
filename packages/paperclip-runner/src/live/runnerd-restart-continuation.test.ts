@@ -24,10 +24,17 @@ it.each(["none", "before-start", "after-start"] as const)("completes after the r
     } },
     interactionResponses: [], credentialBindings: [],
   };
+  const reportPath = join(root, "completion-report.json");
+  await writeFile(reportPath, JSON.stringify({
+    schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Checked the resumed synthetic work.",
+    completionClaim: { contractRevision: "1", objectiveSatisfied: true,
+      criteria: [{ criterionId: "checks", status: "satisfied", evidenceRefs: ["fixture:checks"] }], remainingWork: [] },
+    evidence: [{ ref: "fixture:checks" }], verification: [], attentionRequests: [], artifacts: [],
+  }));
   const options = {
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: resolve(import.meta.dirname, "../../runner/target/debug/fake-codex-app-server"),
-    codexArgs: ["--state-file", join(root, "fake-state.json"), "--call-log", join(root, "calls.log"), "--durable-turn-ids", "--hold-first-durable-turn"],
+    codexArgs: ["--state-file", join(root, "fake-state.json"), "--call-log", join(root, "calls.log"), "--durable-turn-ids", "--hold-first-durable-turn", "--terminal-result-file", reportPath, "--replay-terminal-result-on-resume"],
     stateDirectory: root,
     prpIdentity: { runnerInstanceId: "runner-restart", environmentLeaseId: "lease-restart", runId: identity.runId, normalizedSessionId: identity.sessionId, turnId: "turn-restart", itemId: "item-restart" },
   };
@@ -79,6 +86,9 @@ it.each(["none", "before-start", "after-start"] as const)("completes after the r
         async checkpointSession(snapshot) {
           if (failCheckpoint && crash === "after-start" && snapshot.dispositionOnlyRecoveryTurnId === "provider-turn-2") {
             failCheckpoint = false;
+            // Model abrupt controller loss before its cleanup can send Stop to
+            // the live provider and reject the pending completion report.
+            await restored!.detachControllerForRestart();
             throw interruptedController;
           }
           checkpoints.push(structuredClone(snapshot));
@@ -108,6 +118,7 @@ it.each(["none", "before-start", "after-start"] as const)("completes after the r
     expect(events.filter(event => event.eventType === "run.terminal")).toHaveLength(1);
     if (crash !== "after-start") expect(checkpoints.some(snapshot => snapshot.activeTurnId === "provider-turn-2" && snapshot.terminal === null)).toBe(true);
     expect((await readFile(join(root, "calls.log"), "utf8")).match(/^turn\/start$/gm)).toHaveLength(2);
+    expect((await readFile(join(root, "calls.log"), "utf8")).match(/^terminal-result:accepted$/gm)).toHaveLength(1);
     const journal = JSON.parse(await readFile(join(root, "control-plane/control-plane-state.json"), "utf8"));
     const submissions = journal.commands.filter((command: { type: string }) => command.type === "turn.start");
     expect(submissions).toHaveLength(2);

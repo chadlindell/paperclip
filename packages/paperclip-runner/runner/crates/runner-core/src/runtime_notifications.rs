@@ -46,13 +46,39 @@ struct Activity {
     activity_key: String,
 }
 
+// Codex treats writable permission entries as directory roots. Keep the FIFO
+// in its own writable directory, with the publisher lock outside that grant.
+fn ipc_directory(pipe: &Path) -> Result<&Path, DurableRunnerError> {
+    let directory = pipe
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "ipc"))
+        .filter(|_| pipe.file_name().is_some_and(|name| name == "activity.fifo"))
+        .ok_or_else(|| failure("invalid activity pipe layout"))?;
+    verify_private_directory(directory)?;
+    Ok(directory)
+}
+
+fn activity_lock_path(pipe: &Path) -> Result<PathBuf, DurableRunnerError> {
+    let directory = ipc_directory(pipe)?;
+    let private_root = directory
+        .parent()
+        .ok_or_else(|| failure("invalid activity root"))?;
+    verify_private_directory(private_root)?;
+    Ok(private_root.join("activity.lock"))
+}
+
 // Fixed-path cleanup never traverses provider-created contents.
 struct ActivityPipe(PathBuf);
 impl Drop for ActivityPipe {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-        let _ = fs::remove_file(self.0.with_extension("lock"));
-        let _ = fs::remove_dir(self.0.parent().unwrap());
+        let ipc = self.0.parent().unwrap();
+        let root = ipc.parent().unwrap();
+        if fs::symlink_metadata(ipc).is_ok_and(|metadata| metadata.is_dir()) {
+            let _ = fs::remove_file(&self.0);
+        }
+        let _ = fs::remove_file(root.join("activity.lock"));
+        let _ = fs::remove_dir(ipc);
+        let _ = fs::remove_dir(root);
     }
 }
 
@@ -133,7 +159,7 @@ fn publish(path: &Path, activity: &Activity) -> Result<(), DurableRunnerError> {
         return Err(failure("runtime authority is inactive or changed"));
     }
     // A stable read-only lock serializes publishers; the descriptor can rotate atomically.
-    let guard = private_file(&endpoint.pipe.with_extension("lock"))?;
+    let guard = private_file(&activity_lock_path(&endpoint.pipe)?)?;
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         match guard.try_lock() {
@@ -180,12 +206,17 @@ impl RuntimeNotifications {
             .mode(0o700)
             .create(&directory)
             .map_err(failure)?;
-        let pipe = ActivityPipe(directory.join("activity.fifo"));
+        let ipc = directory.join("ipc");
+        let pipe = ActivityPipe(ipc.join("activity.fifo"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&ipc)
+            .map_err(failure)?;
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(pipe.0.with_extension("lock"))
+            .open(activity_lock_path(&pipe.0)?)
             .map_err(failure)?;
         let status = std::process::Command::new("/usr/bin/mkfifo")
             .args(["-m", "600"])
@@ -340,8 +371,8 @@ pub fn access_paths() -> Option<[PathBuf; 4]> {
     Some([
         PathBuf::from(std::env::var_os(HELPER_ENV)?),
         path,
-        endpoint.pipe.with_extension("lock"),
-        endpoint.pipe,
+        activity_lock_path(&endpoint.pipe).ok()?,
+        ipc_directory(&endpoint.pipe).ok()?.to_path_buf(),
     ])
 }
 
@@ -437,6 +468,52 @@ mod tests {
         server.poll(&config, &mut state, &store);
         (directory, config, store, state, server)
     }
+    #[test]
+    fn writable_ipc_is_a_real_directory_with_no_lock_or_control_metadata() {
+        let (_directory, config, _store, _state, server) = setup();
+        let endpoint = descriptor(&context_path(&config.state_dir)).unwrap();
+        let ipc = ipc_directory(&endpoint.pipe).unwrap();
+        assert!(fs::symlink_metadata(&endpoint.pipe)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        assert_eq!(fs::read_dir(ipc).unwrap().count(), 1);
+        let lock = activity_lock_path(&endpoint.pipe).unwrap();
+        assert_eq!(lock.parent(), ipc.parent());
+        assert!(!lock.starts_with(ipc));
+        assert!(!context_path(&config.state_dir).starts_with(ipc));
+        publish(
+            &context_path(&config.state_dir),
+            &activity(&server.context, "real.fifo"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replacing_ipc_directory_with_symlink_does_not_redirect_publish_or_cleanup() {
+        use std::os::unix::fs::symlink;
+        let (_directory, config, _store, _state, server) = setup();
+        let ipc = ipc_directory(&server.pipe.0).unwrap().to_path_buf();
+        let root = ipc.parent().unwrap().to_path_buf();
+        let saved = root.join("retained-ipc");
+        let outside = TestDirectory::create(&std::env::temp_dir()).unwrap();
+        fs::write(outside.directory.join("activity.fifo"), b"preserved").unwrap();
+        fs::rename(&ipc, &saved).unwrap();
+        symlink(&outside.directory, &ipc).unwrap();
+        assert!(publish(
+            &context_path(&config.state_dir),
+            &activity(&server.context, "redirect")
+        )
+        .is_err());
+        drop(server);
+        assert_eq!(
+            fs::read(outside.directory.join("activity.fifo")).unwrap(),
+            b"preserved"
+        );
+        assert!(fs::symlink_metadata(&ipc).unwrap().file_type().is_symlink());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn capture_is_local_and_authority_rotation_rejects_late_completion() {
         let (_directory, mut config, store, mut state, mut server) = setup();
@@ -595,7 +672,7 @@ mod tests {
         let (_directory, mut config, store, mut state, mut server) = setup();
         let path = context_path(&config.state_dir);
         let old = descriptor(&path).unwrap();
-        let guard = private_file(&old.pipe.with_extension("lock")).unwrap();
+        let guard = private_file(&activity_lock_path(&old.pipe).unwrap()).unwrap();
         guard.try_lock().unwrap();
         config.run_id = "next-run".into();
         state.run_id.clone_from(&config.run_id);
@@ -663,7 +740,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(fs::read(nested.join("protected")).unwrap(), b"unchanged");
-        fs::remove_dir_all(pipe.parent().unwrap()).unwrap();
+        fs::remove_dir_all(pipe.parent().unwrap().parent().unwrap()).unwrap();
     }
     #[test]
     #[ignore = "requires CODEX_NOTIFICATION_SANDBOX_COMMAND and PAPERCLIP_RUNTIME_NOTIFICATION_HELPER"]
@@ -674,6 +751,7 @@ mod tests {
         use std::sync::mpsc;
         let command = std::env::var_os("CODEX_NOTIFICATION_SANDBOX_COMMAND").unwrap();
         let helper = std::env::var_os(HELPER_ENV).unwrap();
+        let command_path = fs::canonicalize(PathBuf::from(&command)).unwrap();
         let directory = TestDirectory::create(&std::env::temp_dir()).unwrap();
         let config = config(directory.directory.clone());
         let store = DurableStateStore::new(&config.state_dir).unwrap();
@@ -684,13 +762,24 @@ mod tests {
         let paths = [
             PathBuf::from(&helper),
             context_path(&config.state_dir),
-            server.pipe.0.with_extension("lock"),
-            server.pipe.0.clone(),
+            activity_lock_path(&server.pipe.0).unwrap(),
+            ipc_directory(&server.pipe.0).unwrap().to_path_buf(),
         ];
         let workspace = config.state_dir.join("workspace");
         fs::create_dir(&workspace).unwrap();
         let home = workspace.join("home");
         fs::create_dir(&home).unwrap();
+        for name in [
+            ".config/gh",
+            ".config/gcloud",
+            ".aws",
+            ".ssh",
+            ".kube",
+            ".docker",
+            ".azure",
+        ] {
+            fs::create_dir_all(home.join(name)).unwrap();
+        }
         let profile = "paperclip-runner-workspace-only";
         let mut args = vec![
             "-c".into(),
@@ -699,7 +788,7 @@ mod tests {
             "shell_environment_policy.include_only=[\"PATH\",\"LANG\"]".into(),
         ];
         for name in [profile, "paperclip-runner-workspace-read-only"] {
-            args.extend(["-c".into(), format!("permissions.{name}.filesystem={{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",\":workspace_roots\"={{\".\"=\"read\"}}}}"),
+            args.extend(["-c".into(), format!("permissions.{name}.filesystem={{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",{}=\"read\",\":workspace_roots\"={{\".\"=\"read\"}}}}", serde_json::to_string(&command_path).unwrap()),
                 "-c".into(), format!("permissions.{name}.network.enabled=false")]);
         }
         let extra = crate::codex_provider::runtime_notification_codex_args(&args, profile, &paths);
@@ -707,8 +796,13 @@ mod tests {
 [ -z "${UNRELATED_SECRET:-}" ] || exit 70
 if cat "$1" >/dev/null 2>&1; then exit 71; fi
 if /bin/sh -c ': >> "$PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT"' 2>/dev/null; then exit 72; fi
-if touch "$2/probe" 2>/dev/null; then exit 75; fi
+# Denied parents can be synthetic writable scaffolding; verify backing state below.
+touch "$2/probe" 2>/dev/null || true
+printf tampered > "$1" 2>/dev/null || true
 if touch "$3/probe" 2>/dev/null; then exit 76; fi
+# The only writable external directory is a disposable IPC channel.
+touch "$3/ipc/disposable" || exit 78
+rm "$3/ipc/disposable" || exit 79
 if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
 context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
 "$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" record-activity "$context" example.runtime desktop.used || exit 74
@@ -752,8 +846,8 @@ context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit
                     assert!(message.get("error").is_none(), "initialize: {message}");
                     writeln!(input, "{}", json!({"method":"initialized","params":{}})).unwrap();
                     writeln!(input, "{}", json!({"id":2,"method":"command/exec","params":{
-                        "command":["/bin/sh","-c",script,"publisher",config.state_dir.join("runner-state.json"),config.state_dir,server.pipe.0.parent().unwrap(),server.pipe.0.with_extension("lock")],
-                        "cwd":workspace,"timeoutMs":10000}})).unwrap();
+                        "command":["/bin/sh","-c",script,"publisher",config.state_dir.join("runner-state.json"),config.state_dir,server.pipe.0.parent().unwrap().parent().unwrap(),activity_lock_path(&server.pipe.0).unwrap()],
+                        "cwd":workspace,"timeoutMs":10000,"permissionProfile":profile}})).unwrap();
                 } else if message["id"] == 2 {
                     response = Some(message);
                 }
@@ -772,6 +866,13 @@ context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit
             )
         });
         assert!(response.get("error").is_none(), "command: {response}");
+        assert!(
+            !config.state_dir.join("probe").exists(),
+            "provider modified the backing runner directory"
+        );
+        let backing_state = fs::read(config.state_dir.join("runner-state.json")).unwrap();
+        serde_json::from_slice::<Value>(&backing_state)
+            .expect("provider corrupted backing runner state");
         assert_eq!(response["result"]["exitCode"], 0, "publisher: {response}");
         let deadline = Instant::now() + Duration::from_secs(2);
         while state.outbox.is_empty() && Instant::now() < deadline {

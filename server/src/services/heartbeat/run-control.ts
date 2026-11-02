@@ -12,7 +12,8 @@ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProc
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
 import { publishActivity, type ActivityPublication } from "../activity-log.js";
-import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
+import { DEFERRED_WAKE_CONTEXT_KEY, deferredExecutionOwnershipWaitPredicate,
+  executionOwnershipWaitAppliesToIssue, isDeferredExecutionOwnershipWait } from "./queue.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./recovery.js";
 import {
   type WakeupOptions,
@@ -849,6 +850,98 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       await resumeRemoteStopComments(run, wake.id).catch(err => {
         scope.onError?.(err);
         logger.warn({ err, runId: run.id }, "failed to resume saved execution-wait message");
+      });
+    }
+  }
+
+  async function resumeExecutionOwnershipWait(snapshot: typeof agentWakeupRequests.$inferSelect) {
+    const issueId = readNonEmptyString(parseObject(snapshot.payload).issueId);
+    if (!issueId || !isUuidLike(issueId)) return;
+    const now = new Date();
+    const wake = await db.transaction(async (tx) => {
+      const [issue] = await tx.select().from(issues).where(and(
+        eq(issues.companyId, snapshot.companyId), eq(issues.id, issueId),
+      )).for("update");
+      const [current] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, snapshot.id), eq(agentWakeupRequests.companyId, snapshot.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      if (!current || !isDeferredExecutionOwnershipWait(current.payload) ||
+          readNonEmptyString(parseObject(current.payload).issueId) !== issueId) return null;
+      const retire = async (reason: string) => {
+        await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
+          .where(and(eq(agentWakeupRequests.id, current.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        return null;
+      };
+      if (!issue || ["done", "cancelled"].includes(issue.status)) {
+        return retire("Deferred execution wake no longer applies to a terminal task");
+      }
+      if (!executionOwnershipWaitAppliesToIssue(current.payload, issue, current.agentId)) {
+        return retire("Deferred execution wake no longer applies to the task owner or stage");
+      }
+      const laterRuns = await tx.select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, current.companyId), eq(heartbeatRuns.agentId, current.agentId),
+          or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, eq(heartbeatRuns.nativeIssueId, issueId)),
+          gt(heartbeatRuns.createdAt, current.requestedAt),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        )).limit(1);
+      if (laterRuns.length) return null;
+      if (!["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return null;
+      if (await getExecutionBlocker(tx as unknown as Db, current.companyId, issueId)) {
+        await tx.update(agentWakeupRequests).set({ updatedAt: now }).where(eq(agentWakeupRequests.id, current.id));
+        return null;
+      }
+      return current;
+    });
+    if (!wake) return;
+    const payload = parseObject(wake.payload);
+    const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+    const resumePayload = { ...payload };
+    delete resumePayload.executionWait;
+    delete resumePayload[DEFERRED_WAKE_CONTEXT_KEY];
+    const run = await enqueueWakeup(wake.agentId, {
+      source: wake.source as WakeupOptions["source"],
+      triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+      reason: readNonEmptyString(context.wakeReason) ?? wake.reason,
+      payload: resumePayload, contextSnapshot: context,
+      requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+      requestedByActorId: wake.requestedByActorId,
+      idempotencyKey: `execution-wait-resume:${wake.id}`,
+      executionWaitResumeId: wake.id,
+      executionWaitResumePayload: payload,
+    }, wake.id);
+    if (!run) return;
+    await db.update(agentWakeupRequests).set({ status: "coalesced", runId: run.id, finishedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.payload, payload)));
+  }
+
+  async function resumeExecutionOwnershipWaits(scope: DeferredReceiptRecoveryOptions & { issueId?: string } = {}) {
+    if ((await getSchedulingSuppression()).suppressed) return;
+    const cadence = new Date(Date.now() - 30_000);
+    const parked = await db.select({ wake: agentWakeupRequests }).from(agentWakeupRequests)
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(
+        deferredExecutionOwnershipWaitPredicate(),
+        scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+        scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
+        scope.issueId ? sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`
+          : lte(agentWakeupRequests.updatedAt, cadence),
+      ))
+      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.requestedAt)).limit(50);
+    for (const { wake } of parked) {
+      if (!isDeferredExecutionOwnershipWait(wake.payload)) continue;
+      if (!scope.issueId) {
+        const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+          deferredExecutionOwnershipWaitPredicate(), lte(agentWakeupRequests.updatedAt, cadence),
+        )).returning({ id: agentWakeupRequests.id });
+        if (!claimed) continue;
+      }
+      await resumeExecutionOwnershipWait(wake).catch((err) => {
+        scope.onError?.(err);
+        logger.warn({ err, wakeId: wake.id }, "failed to resume a wake parked behind an execution ownership hold");
       });
     }
   }
@@ -1744,6 +1837,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     resumeRemoteStopComments,
     cancelRunInternal,
     resumeExecutionWaitComments,
+    resumeExecutionOwnershipWaits,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments: resumeSavedComments,
     resumeTaskRetry,

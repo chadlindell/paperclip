@@ -774,18 +774,28 @@ fn terminal_events(
             .last_agent_message
             .as_deref()
             .is_none_or(|text| text.trim().is_empty());
-    if rejected_completion || empty_opencode_completion {
+    // A provider turn ending (or its native goal becoming complete) is not
+    // a completion report for Paperclip's bound task contract. Only an accepted
+    // semantic result can claim that the objective and criteria were satisfied.
+    let missing_completion = state.active_provider_result_fingerprint.is_none()
+        && (goal_status == Some("complete")
+            || (goal_status.is_none() && event_type == "turn.completed"));
+    if rejected_completion || empty_opencode_completion || missing_completion {
         return vec![
             NormalizedProviderEvent {
                 event_type: "session.failed".to_owned(),
                 priority: EventPriority::P0,
                 payload: json!({
                     "provider": state.config.provider,
-                    "code": if rejected_completion { "semantic_completion_rejected" } else { "opencode_empty_response" },
+                    "code": if rejected_completion { "semantic_completion_rejected" }
+                        else if empty_opencode_completion { "opencode_empty_response" }
+                        else { "semantic_completion_missing" },
                     "message": if rejected_completion {
                         "The turn ended without correcting its rejected completion report."
-                    } else {
+                    } else if empty_opencode_completion {
                         "OpenCode ended without a final answer or an accepted completion report."
+                    } else {
+                        "The provider turn ended without an accepted completion report."
                     },
                     "recoverable": false,
                 }),
@@ -807,20 +817,25 @@ fn terminal_events(
     // bounded controller finalizer may interrupt the provider after the result
     // proposal. That provider terminal closes the exact turn; it does not
     // revoke the already-authoritative semantic outcome.
-    let succeeded = goal_status == Some("complete")
-        || (goal_status.is_none()
-            && (event_type == "turn.completed"
-                || state.active_provider_result_fingerprint.is_some()));
+    let succeeded = state.active_provider_result_fingerprint.is_some()
+        || goal_status == Some("complete")
+        || (goal_status.is_none() && event_type == "turn.completed");
     let cancelled = matches!(event_type, "turn.cancelled" | "turn.interrupted");
-    let disposition = match goal_status {
-        Some("blocked") => "blocked",
-        Some("paused" | "limited" | "usage_limited" | "budget_limited") => "yielded",
-        Some("complete") => "done",
-        _ => state
-            .active_provider_result_disposition
-            .as_deref()
-            .unwrap_or(if succeeded { "done" } else { "needs_review" }),
-    };
+    let disposition = state
+        .active_provider_result_disposition
+        .as_deref()
+        .unwrap_or(match goal_status {
+            Some("blocked") => "blocked",
+            Some("paused" | "limited" | "usage_limited" | "budget_limited") => "yielded",
+            Some("complete") => "done",
+            _ => {
+                if succeeded {
+                    "done"
+                } else {
+                    "needs_review"
+                }
+            }
+        });
     let provider = state.config.provider.as_str();
     let provider_name = if provider == "opencode" {
         "OpenCode"
@@ -5716,15 +5731,14 @@ mod tests {
         restored.reconcile_active_provider_turn(Some("turn-2".to_owned()));
 
         assert_eq!(
-            terminal_events(&restored, "turn.completed", None)[0].payload
-                ["reportedWorkDisposition"],
-            "done"
+            terminal_events(&restored, "turn.completed", None)[0].payload["code"],
+            "semantic_completion_missing"
         );
         assert!(restored.validate().is_ok());
     }
 
     #[test]
-    fn legacy_snapshot_without_a_rejected_finish_marker_keeps_its_fallback() {
+    fn legacy_snapshot_without_a_rejected_finish_marker_still_requires_a_report() {
         let mut encoded = serde_json::to_value(declared_finish_state()).unwrap();
         assert!(encoded
             .as_object_mut()
@@ -5734,9 +5748,8 @@ mod tests {
         let restored: CodexProviderState = serde_json::from_value(encoded).unwrap();
 
         assert_eq!(
-            terminal_events(&restored, "turn.completed", None)[0].payload
-                ["reportedWorkDisposition"],
-            "done"
+            terminal_events(&restored, "turn.completed", None)[0].payload["code"],
+            "semantic_completion_missing"
         );
         assert!(restored.validate().is_ok());
     }
@@ -5750,8 +5763,8 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            terminal_events(&state, "turn.completed", None)[0].payload["reportedWorkDisposition"],
-            "done"
+            terminal_events(&state, "turn.completed", None)[0].payload["code"],
+            "semantic_completion_missing"
         );
         assert!(state.validate().is_ok());
     }
@@ -5773,24 +5786,152 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_final_message_without_a_finish_attempt_keeps_its_fallback() {
+    fn unreported_commentary_after_listing_cannot_satisfy_the_task_contract() {
+        let mut state = declared_finish_state();
+        let commands = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({
+                "threadId": "thread-1", "turnId": "turn-1", "item": {
+                    "id": "listing", "type": "commandExecution", "command": "ls -la",
+                    "cwd": "/synthetic/workspace", "status": "completed", "exitCode": 0,
+                    "aggregatedOutput": "contract.json\nqualification_task.py\n"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(commands
+            .iter()
+            .any(|event| event.event_type == "tool.execution.completed"));
+        state.last_agent_message = Some("I need to run the specified fixture command `python3 qualification_task.py productive` as instructed. Let me first check what this script contains to understand what it does.".to_owned());
+        assert!(state.active_provider_result_fingerprint.is_none());
+        let events = terminal_events(&state, "turn.completed", None);
+        assert!(events
+            .iter()
+            .all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["reportedWorkDisposition"] != "done"));
+        assert_eq!(events[0].event_type, "session.failed");
+        assert_eq!(events[0].payload["code"], "semantic_completion_missing");
+        assert_eq!(events[0].payload["recoverable"], false);
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
+    }
+
+    #[test]
+    fn unreported_provider_goal_completion_cannot_satisfy_the_task_contract() {
+        let state = declared_finish_state();
+        let events = terminal_events(&state, "turn.completed", Some("complete"));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["reportedWorkDisposition"] != "done"));
+        assert_eq!(events[0].event_type, "session.failed");
+        assert_eq!(events[0].payload["code"], "semantic_completion_missing");
+        assert_eq!(events[0].payload["recoverable"], false);
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
+    }
+
+    #[test]
+    fn unreported_empty_turn_cannot_satisfy_the_task_contract() {
+        let state = declared_finish_state();
+        let events = terminal_events(&state, "turn.completed", None);
+        assert!(events
+            .iter()
+            .all(|event| event.payload["completionClaim"]["objectiveSatisfied"] != true));
+        assert!(events
+            .iter()
+            .all(|event| event.payload["reportedWorkDisposition"] != "done"));
+        assert_eq!(events[0].event_type, "session.failed");
+        assert_eq!(events[0].payload["code"], "semantic_completion_missing");
+        assert_eq!(events[0].payload["recoverable"], false);
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
+    }
+
+    #[test]
+    fn ordinary_final_message_without_a_finish_attempt_requires_a_report() {
         let mut state = declared_finish_state();
         state.last_agent_message = Some("The requested answer is ready.".to_owned());
-
         let events = terminal_events(&state, "turn.completed", None);
-
-        assert_eq!(events[0].payload["reportedWorkDisposition"], "done");
-        assert_eq!(
-            events[0].payload["completionClaim"]["objectiveSatisfied"],
-            true
-        );
-        assert_eq!(
-            events[0].payload["summary"],
-            "The requested answer is ready."
-        );
-        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+        assert_eq!(events[0].event_type, "session.failed");
+        assert_eq!(events[0].payload["code"], "semantic_completion_missing");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "run.result.proposed"));
         assert!(terminal_events(&state, "turn.completed", Some("active")).is_empty());
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_completion_disposition_survives_inactive_goals_and_interrupts() {
+        for disposition in ["done", "needs_review", "yielded", "blocked"] {
+            let mut state = declared_finish_state();
+            let mut result = valid_opencode_result();
+            result["reportedWorkDisposition"] = json!(disposition);
+            if disposition == "needs_review" {
+                result["attentionRequests"] = json!([{
+                    "kind": "review", "summary": "Review the delivered result.", "ownerClass": "human"
+                }]);
+            } else if disposition == "yielded" {
+                result["continuation"] = json!({
+                    "kind": "response_wake", "summary": "Wait for the response.", "idempotencyKey": "response-1"
+                });
+            }
+            let tool_name = if disposition == "blocked" {
+                result["completionClaim"]["objectiveSatisfied"] = json!(false);
+                result["completionClaim"]["criteria"][0]["status"] = json!("unknown");
+                result["completionClaim"]["criteria"][0]["evidenceRefs"] = json!([]);
+                result["completionClaim"]["remainingWork"] = json!([{
+                    "description": "Restore the unavailable test fixture.", "blocksCompletion": true
+                }]);
+                result["blocker"] = json!({
+                    "reasonCode": "test_fixture_unavailable",
+                    "owner": {"kind": "system", "name": "test fixture"},
+                    "unblockAction": "Restore the test fixture.",
+                    "scope": "task_wide"
+                });
+                "paperclip_block"
+            } else {
+                "paperclip_finish"
+            };
+            admit_terminal_tool_authority(&mut state, tool_name, &result, false).unwrap();
+            for event_type in ["turn.completed", "turn.interrupted", "turn.cancelled"] {
+                assert!(terminal_events(&state, event_type, Some("active")).is_empty());
+                for goal in [
+                    None,
+                    Some("complete"),
+                    Some("paused"),
+                    Some("blocked"),
+                    Some("limited"),
+                    Some("usage_limited"),
+                    Some("budget_limited"),
+                ] {
+                    let events = terminal_events(&state, event_type, goal);
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].event_type, "run.terminal");
+                    assert_eq!(events[0].payload["reportedWorkDisposition"], disposition);
+                    assert_eq!(
+                        events[0].payload["runTerminalState"], "succeeded",
+                        "accepted {disposition}, {event_type}, goal {goal:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6008,7 +6149,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_terminal_fallback_uses_its_actual_provider_identity() {
+    fn opencode_missing_completion_uses_its_actual_provider_identity() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
                 provider: "opencode".to_owned(),
@@ -6039,11 +6180,9 @@ mod tests {
 
         let events = terminal_events(&state, "turn.completed", None);
 
-        assert_eq!(events[0].payload["summary"], "The actual final answer.");
-        assert_eq!(
-            events[0].payload["evidence"][0]["ref"],
-            "provider:opencode:agent-message"
-        );
+        assert_eq!(events[0].event_type, "session.failed");
+        assert_eq!(events[0].payload["code"], "semantic_completion_missing");
+        assert_eq!(events[0].payload["provider"], "opencode");
         assert_eq!(events[1].payload["provider"], "opencode");
         assert!(!events[0].payload.to_string().contains("Codex"));
     }
@@ -6213,7 +6352,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_a_structured_result_before_the_terminal_event() {
+    fn transport_completion_without_a_report_emits_failure_before_terminal() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
                 provider: "codex".to_owned(),
@@ -6242,10 +6381,10 @@ mod tests {
         );
         state.last_agent_message = Some("Finished the requested work.".to_owned());
         let events = terminal_events(&state, "turn.completed", None);
-        assert_eq!(events[0].event_type, "run.result.proposed");
-        assert_eq!(events[0].payload["summary"], "Finished the requested work.");
+        assert_eq!(events[0].event_type, "session.failed");
+        assert_eq!(events[0].payload["code"], "semantic_completion_missing");
         assert_eq!(events[1].event_type, "run.terminal");
-        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
     }
 
     #[test]

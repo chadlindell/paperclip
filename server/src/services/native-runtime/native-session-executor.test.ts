@@ -11103,6 +11103,68 @@ describe("native session bounded recovery", () => {
     expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
   });
 
+  it("holds a missing semantic completion without completing the issue or stranding its execution owner", async () => {
+    // Real runtime and executor, controlled provider protocol and database ports.
+    // This is the Rust provider's new terminal sequence, not a live CLI trial.
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const identity = { ...execution.binding, sessionId: execution.session.normalizedSessionId! };
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const events: PrpEvent[] = [
+      ["item.completed", { kind: "agentMessage", channel: "progress", text: "I need to run the specified fixture command." }],
+      ["session.failed", { provider: "codex", code: "semantic_completion_missing", recoverable: false,
+        message: "The provider turn ended without an accepted completion report." }],
+      ["turn.completed", { status: "completed" }],
+      ["run.terminal", { schema: "paperclip.prp.terminal.v1", provider: "codex", turnTerminalState: "failed",
+        runTerminalState: "failed", reportedWorkDisposition: "needs_review" }],
+    ].map(([eventType, payload], index) => ({ schema: "paperclip.prp.event.v1", schemaVersion: 1,
+      sourceEventId: `missing-result:${execution.binding.runId}:${index + 1}`, sourceInstanceId: "missing-result",
+      sourceKind: "runner", sourceSeq: index + 1, runId: execution.binding.runId,
+      normalizedSessionId: identity.sessionId, turnId: "missing-result-turn", eventType, payload,
+      emittedAt: new Date().toISOString(), priority: 0 })) as PrpEvent[];
+    const close = vi.fn(async () => {}), startTurn = vi.fn(async () => ({ turnId: "missing-result-turn" }));
+    const completeRun = vi.fn(async () => {});
+    const appended: PrpEvent[] = [];
+    const session = { identity: () => identity, capabilities: async () => capabilities, startTurn,
+      async *events() { yield* events; }, result: async () => null,
+      snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity,
+        providerSessionId: "missing-result-provider", cursor: null, activeTurnId: null, pendingRuntimeRequests: [] }), close };
+    const backend = { descriptor: async () => ({ kind: "mock", name: "missing-semantic-result", version: "1", capabilities }),
+      openSession: async () => session };
+    state.execute.mockReset().mockImplementationOnce(options => executeNativeSession({ ...options,
+      onSessionAdmission: undefined, timeoutMs: 1000,
+      controlPlane: { async openRun() {}, async checkpointSession() {},
+        async appendEvent(event) { appended.push(event as PrpEvent); const sequence = "sourceSeq" in event ? event.sourceSeq : event.sequence;
+          return { cursor: sequence, highestContiguousSourceSeq: sequence, disposition: "committed" as const }; },
+        async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun },
+    }));
+    state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+    const updateIssue = vi.fn(async () => ({ status: "blocked", statusVersion: 1 }));
+    const service = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: updateIssue } as never);
+    try {
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution,
+        runnerInstanceId: "runner", backend: backend as never, useRunnerd: false })).rejects.toMatchObject({
+          code: "native_provider_terminal_failed", providerCode: "semantic_completion_missing", recoverable: false,
+        });
+      expect(startTurn).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
+      expect(completeRun).not.toHaveBeenCalled();
+      // Failure wins at turn completion before the result-less run terminal
+      // reaches the coordinator's stricter terminal-result validator.
+      expect(appended.map(event => event.eventType)).toEqual(["item.completed", "session.failed", "turn.completed"]);
+      expect(appended.some(event => event.eventType === "run.result.proposed")).toBe(false);
+      expect(updates.find(update => update.table === nativeRunFinalizations && update.values.phase === "terminal_failure")?.values)
+        .toMatchObject({ failureCode: "native_provider_terminal_failed", nextAttemptAt: null, leaseOwner: null,
+          leaseExpiresAt: null, recoveryState: "blocked", failureDetail: { originalFailureCode: "semantic_completion_missing" } });
+      expect(updates.find(update => update.table === heartbeatRuns && update.values.status === "failed")?.values)
+        .toMatchObject({ errorCode: "native_provider_terminal_failed", nativePhase: "terminal_failure" });
+      expect(updates.some(update => update.table === nativeRunResults)).toBe(false);
+      expect(updateIssue).toHaveBeenCalledWith(execution.binding.issueId, { status: "blocked" }, expect.anything());
+      expect(updates.find(update => update.table === issues)?.values).toMatchObject({ executionRunId: null, checkoutRunId: null });
+      expect(state.upsertRecoveryAction).toHaveBeenCalledWith(expect.objectContaining({
+        cause: "native_provider_terminal_failed", ownerType: "board", wakePolicy: null,
+      }));
+    } finally { service.mockRestore(); }
+  });
+
   it("keeps typed integrity failure permanent even if a wrapper changes its message", () => {
     const failure = new NativeSessionProtocolIntegrityError(
       "semantic_input_digest_mismatch",

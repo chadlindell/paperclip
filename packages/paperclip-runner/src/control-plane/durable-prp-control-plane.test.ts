@@ -4782,3 +4782,124 @@ it("retires late semantic receipts without overwriting a successor journal or re
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+it("fences a queued semantic input before stopped ingress finishes draining", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-semantic-fence-drain-"));
+  let release!: () => void;
+  const held = new Promise<void>(resolveHeld => { release = resolveHeld; });
+  let checkpointEntered = false;
+  const dispatch = vi.fn(async () => ({ result: { mustNotExecute: true } }));
+  const recover = vi.fn(async () => ({ result: { mustNotRecover: true } }));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion,
+    expectedRunnerDigest, onSemanticToolInput: dispatch, recoverSemanticToolInput: recover });
+  core.setCheckpointPersistence(async checkpoint => {
+    if (JSON.parse(checkpoint.records.get("cursor")!).ackedSourceSeq > 0) {
+      checkpointEntered = true;
+      await held;
+    }
+  });
+  let client: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    client = await authenticate(core, core.issueBootstrapTicket());
+    sendSecure(client!, semanticInputEvent());
+    await vi.waitFor(() => expect(checkpointEntered).toBe(true));
+    core.fenceSemanticToolCallbacks();
+    core.disconnectActiveRunner();
+    await core.stop();
+    const draining = core.drainPendingConnectionProcessing();
+    release();
+    await draining;
+    await core.recoverPendingSemanticInputs();
+    await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(core.store.state.commands.some(command => command.type === "semantic_tool.result")).toBe(false);
+    expect(core.semanticToolResultsSettled()).toBe(false);
+  } finally {
+    release(); client?.socket.destroy(); await core.stop();
+    await core.drainPendingConnectionProcessing();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it.each(["success", "not_dispatched"] as const)("fences a late semantic %s result before drain can succeed", async outcome => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-semantic-fence-result-"));
+  let release!: () => void;
+  const held = new Promise<void>(resolveHeld => { release = resolveHeld; });
+  const dispatch = vi.fn(async () => {
+    await held;
+    if (outcome === "not_dispatched") throw new SemanticToolNotDispatchedError();
+    return { result: { committedBeforeDetach: true } };
+  });
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion,
+    expectedRunnerDigest, onSemanticToolInput: dispatch });
+  let client: AuthenticatedClient | null = null;
+  try {
+    await core.start(); client = await authenticate(core, core.issueBootstrapTicket());
+    sendSecure(client!, semanticInputEvent());
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+    core.fenceSemanticToolCallbacks();
+    // Stop/drain need not succeed for the synchronous fence to revoke writes.
+    expect(() => core.retireSemanticToolCallbacks()).toThrow("drained, stopped ingress");
+    const before = readFileSync(resolve(root, "control-plane-state.json"), "utf8");
+    release();
+    await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    expect(readFileSync(resolve(root, "control-plane-state.json"), "utf8")).toBe(before);
+    expect(core.store.state.commands.some(command => command.type === "semantic_tool.result")).toBe(false);
+  } finally {
+    release(); client?.socket.destroy(); await core.stop();
+    await core.drainPendingConnectionProcessing();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it("fences semantic recovery before invoking an external reconciler", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-semantic-fence-recovery-"));
+  const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest };
+  const original = new DurablePrpControlPlane({ ...options,
+    onSemanticToolInput: () => new Promise<{ result: unknown }>(() => undefined) });
+  const recover = vi.fn(async () => ({ result: { mustNotRecover: true } }));
+  let replacement: DurablePrpControlPlane | undefined;
+  let client: AuthenticatedClient | null = null;
+  try {
+    await original.start(); client = await authenticate(original, original.issueBootstrapTicket());
+    sendSecure(client!, semanticInputEvent());
+    expect((await receiveSecure(client!))!.kind).toBe("ack");
+    await original.stop(); await original.drainPendingConnectionProcessing();
+    replacement = new DurablePrpControlPlane({ ...options, recoverSemanticToolInput: recover });
+    replacement.fenceSemanticToolCallbacks();
+    await replacement.recoverPendingSemanticInputs();
+    expect(recover).not.toHaveBeenCalled();
+    expect(replacement.store.state.commands).toHaveLength(0);
+  } finally {
+    client?.socket.destroy(); await original.stop(); await replacement?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it.each([false, true])("joins external checkpoint persistence before drain proves settlement (reject=%s)", async reject => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-persistence-drain-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  let release!: () => void;
+  const held = new Promise<void>(resolveHeld => { release = resolveHeld; });
+  let entered = false;
+  core.setCheckpointPersistence(async () => { entered = true; await held; if (reject) throw new Error("checkpoint unavailable"); });
+  let draining: Promise<void> | undefined;
+  try {
+    core.queueCommand("session.snapshot", {}, "before-detach");
+    await vi.waitFor(() => expect(entered).toBe(true));
+    await core.stop();
+    let settled = false;
+    draining = core.drainPendingConnectionProcessing();
+    void draining.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    expect(settled).toBe(false);
+    release();
+    if (reject) await expect(draining).rejects.toThrow("checkpoint unavailable");
+    else await expect(draining).resolves.toBeUndefined();
+  } finally {
+    release(); await Promise.allSettled([draining, core.flushCheckpoint()]);
+    await core.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});

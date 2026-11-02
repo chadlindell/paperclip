@@ -203,8 +203,18 @@ Core records the original turn terminal before rejecting goal success or further
 goal continuation. Recoverable goal failures retain their existing behavior.
 The rejection survives same-turn restoration;
 a new turn or run binding clears it. A later accepted completion report keeps
-its normal authority, and ordinary turns with no completion-tool attempt keep
-their existing fallback.
+its normal authority. An ordinary completed turn or completed provider goal
+without an accepted semantic completion report emits `session.failed` with
+`semantic_completion_missing` and `recoverable: false`, followed by the original
+turn terminal and a failed `run.terminal`. It emits no `run.result.proposed`;
+provider text and transport completion cannot satisfy the task contract. Core's
+existing permanent failure path retains a visible recovery owner and clears
+the completed execution's task ownership instead of marking the issue done.
+If a goal becomes complete after an active turn has already ended, Core also
+requires an accepted semantic report; a late goal update alone raises the same
+typed `semantic_completion_missing` failure. An accepted report retains its
+disposition and evidence when the provider goal subsequently pauses, blocks, or
+reaches a usage limit. Goal lifecycle metadata cannot rewrite that report.
 
 Before interrupting a Codex turn, the runner durably records a
 `harness.diagnostic` event with code `provider_interrupt_requested`, the stop
