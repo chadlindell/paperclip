@@ -365,7 +365,7 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   assert.ok(!files.includes(dotRunnerSuitePath));
   assert.ok(!files.includes(restartRecoverySuitePath));
   assert.ok(!files.includes(usageDeliverySuitePath));
-  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath, usageDeliverySuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
+  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath, usageDeliverySuitePath].sort(), full.selectedGeneralServerSuites.sort());
   assert.equal(new Set(files).size, files.length);
   const defaultRun = dryRunJson([], prEnv);
   assert.ok(defaultRun.generalServerSuiteCount === full.generalServerSuiteCount);
