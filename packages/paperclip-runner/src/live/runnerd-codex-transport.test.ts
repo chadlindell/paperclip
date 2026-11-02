@@ -6997,9 +6997,14 @@ it.each([
       if (retirementFailure !== null) {
         const failures = retirementFailure instanceof AggregateError
           ? retirementFailure.errors : [retirementFailure];
-        for (const failure of failures) expect(String(failure)).toMatch(
-          /fixture controller persistence unavailable after loss|Controller (?:startup drain|route release|ingress stop|journal drain) timed out/,
-        );
+        const expectedLoss = /fixture controller persistence unavailable after loss|Controller (?:startup drain|route release|ingress stop|journal drain) timed out/;
+        expect(failures.some(failure => expectedLoss.test(String(failure)))).toBe(true);
+        for (const failure of failures) {
+          // Expiring the same deadline before stop settles also prevents drain
+          // from certifying retirement. It is allowed only with the loss above.
+          expect(expectedLoss.test(String(failure)) || String(failure) ===
+            "Error: Connection processing drain requires stopped ingress.").toBe(true);
+        }
       }
       // The fixture models permanent controller storage loss. A failed detach
       // is not takeover authority: join the exact owned processes below before
