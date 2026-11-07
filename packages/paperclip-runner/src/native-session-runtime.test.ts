@@ -1035,9 +1035,12 @@ describe("executeNativeSession recovery", () => {
         yield runnerEvent(2, "session.failed", { code: "provider_exited", provider: "codex", recoverable: true,
           expected: false, completedByExitedProcess: false, previousTurnCompleted: false, exitCode: 1, processGeneration: 1 });
         reached(); await held;
-        yield runnerEvent(3, "session.goal.updated", { goal: activeGoal, workingNow: false });
-        yield runnerEvent(4, "turn.completed");
-        yield runnerEvent(5, "session.goal.snapshot", { goal: completeGoal, workingNow: false });
+        // Completion comes from the provider's explicit report after recovery,
+        // not from the goal reaching "complete".
+        yield runnerEvent(3, "run.result.proposed", result);
+        yield runnerEvent(4, "session.goal.updated", { goal: activeGoal, workingNow: false });
+        yield runnerEvent(5, "turn.completed");
+        yield runnerEvent(6, "session.goal.snapshot", { goal: completeGoal, workingNow: false });
       },
       async startTurn() { return { turnId: "turn-recovery" }; },
       async result() { return null; },
@@ -1063,7 +1066,7 @@ describe("executeNativeSession recovery", () => {
       await failureObserved;
       expect(settled).toBe(false); expect(close).not.toHaveBeenCalled(); expect(completeRun).not.toHaveBeenCalled();
       release();
-      expect(await observed).toMatchObject({ result: { reportedWorkDisposition: "done" } });
+      expect(await observed).toMatchObject({ result: { ...result, reportedWorkDisposition: "done" } });
       expect(close).toHaveBeenCalledOnce(); expect(completeRun).toHaveBeenCalledOnce();
     } finally { release(); await observed.catch(() => undefined); }
   });
