@@ -1,7 +1,46 @@
 import { agentWakeupRequests, heartbeatRuns, statusDecisions, statusDecisionEffects, type Db } from "@paperclipai/db";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
+import { isUuidLike } from "@paperclipai/shared";
 import { boundRunIssueIdSql } from "../run-task-binding.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../acknowledged-native-stop.js";
+import { readRunCancellation } from "../run-cancellation.js";
+
+export async function hasDeferredNativeWakeStop(db: Db,
+  wake: Pick<typeof agentWakeupRequests.$inferSelect, "companyId" | "agentId" | "requestedByActorType" | "requestedByActorId" | "requestedAt" | "payload">,
+  issueId: string,
+): Promise<boolean> {
+  const context = wake.payload?._paperclipWakeContext as Record<string, unknown> | undefined;
+  const intentId = context?.nativeStatusWakeIntentId;
+  if (typeof intentId !== "string" || !isUuidLike(intentId) || wake.requestedByActorType !== "system" ||
+      wake.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return false;
+  const [intent] = await db.select({ requestedAt: sql<string>`${agentWakeupRequests.requestedAt}::text` }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+    eq(agentWakeupRequests.source, "automation"), eq(agentWakeupRequests.requestedByActorType, "system"),
+    eq(agentWakeupRequests.requestedByActorId, "native-status-committer"), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+  )).limit(1);
+  // Preserve PostgreSQL precision: rounding a post-Stop intent down to its
+  // millisecond can incorrectly hold its entire coalesced delivery.
+  const requestedAt = intent?.requestedAt ?? wake.requestedAt.toISOString();
+  const stopped = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId), eq(heartbeatRuns.status, "cancelled"),
+    eq(boundRunIssueIdSql(), issueId), sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) >= ${requestedAt}::timestamptz`,
+    or(eq(heartbeatRuns.runtimeMode, "native"), sql`not exists (select 1 from ${agentWakeupRequests} interrupt
+      where interrupt.company_id = ${wake.companyId} and interrupt.agent_id = ${wake.agentId}
+        and interrupt.id::text = ${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId'
+        and interrupt.status = 'deferred_issue_execution' and interrupt.payload->>'issueId' = ${issueId})`),
+    or(sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'acknowledged'`,
+      sql`${heartbeatRuns.resultJson}->'cancellation'->>'source' = 'operator'`,
+      sql`${heartbeatRuns.resultJson}->'nativeCancellation'->>'dispatchState' = 'acknowledged'`),
+  ));
+  return stopped.some(run => {
+    const cancellation = readRunCancellation(run.resultJson);
+    const queuedStop = run.runtimeMode === "legacy" && run.runtimeModeResolvedAt === null && run.startedAt === null &&
+      run.processStartedAt === null && run.processPid === null && run.processGroupId === null && cancellation?.source === "operator" && cancellation.expected;
+    return queuedStop || (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged" ||
+      isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run);
+  });
+}
 
 /** Recover conversation provenance from a committed continuation, never from
  * provider-supplied source IDs or the mere presence of a chat on the task. */

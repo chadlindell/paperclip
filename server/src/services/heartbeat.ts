@@ -339,6 +339,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import {
   and,
+  desc,
   eq,
   exists,
   inArray,
@@ -1314,6 +1315,7 @@ export function heartbeatService(
     liveRunExecutions,
     getSchedulingSuppression,
     resumeExecutionWaitComments,
+    resumeExecutionOwnershipWaits,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
@@ -1530,6 +1532,10 @@ export function heartbeatService(
 
   function resumeExecutionWaitComments(...args: Parameters<typeof runControl.resumeExecutionWaitComments>) {
     return runControl.resumeExecutionWaitComments(...args);
+  }
+
+  function resumeExecutionOwnershipWaits(...args: Parameters<typeof runControl.resumeExecutionOwnershipWaits>) {
+    return runControl.resumeExecutionOwnershipWaits(...args);
   }
 
   function resumeQueuedCommentInterrupt(...args: Parameters<typeof runControl.resumeQueuedCommentInterrupt>) {
@@ -4113,10 +4119,10 @@ export function heartbeatService(
       }
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.companyId, run.companyId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
           sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
-        )).limit(1);
+        )).orderBy(desc(sql`${agentWakeupRequests.agentId} = ${run.agentId}`)).limit(1);
         if (pending) await (pending.payload?.queuedCommentInterrupt
           ? resumeQueuedCommentInterrupt(run.companyId, pending.id)
           : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {
@@ -4131,6 +4137,14 @@ export function heartbeatService(
         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {
           logger.warn({ err, runId: run.id }, "failed to resume user messages after remote Stop");
         });
+        const ownershipWaitIssueId = latestRun && isHeartbeatRunTerminalStatus(latestRun.status)
+          ? readNonEmptyString(latestRun.contextSnapshot?.issueId) ?? latestRun.nativeIssueId
+          : null;
+        if (ownershipWaitIssueId) {
+          await resumeExecutionOwnershipWaits({ companyId: run.companyId, issueId: ownershipWaitIssueId }).catch(err => {
+            logger.warn({ err, runId: run.id }, "failed to resume wakes parked behind the released execution hold");
+          });
+        }
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
           await toolActionDeliveryService(db, { wakeup: trackWakeup })
             .deliverForRun({ companyId: run.companyId, runId: run.id })
@@ -4458,6 +4472,7 @@ export function heartbeatService(
     resumeTaskRetry: runControl.resumeTaskRetry,
     resumeQueuedCommentInterrupt,
     resumeExecutionWaitComments,
+    resumeExecutionOwnershipWaits,
 
     sweepStaleIssueLocks,
 

@@ -15,6 +15,8 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
+import { deferredExecutionOwnershipWaitPredicate } from "../../../services/heartbeat/ownership-wait-predicate.js";
+import { hasDeferredNativeWakeStop } from "../../../services/native-runtime/native-continuation-delivery.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import type { Db } from "@paperclipai/db";
@@ -239,6 +241,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              interruptQueueId ? undefined
+                : sql`not (${deferredExecutionOwnershipWaitPredicate()})`,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -250,6 +254,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
         const candidate = toDeferredWakeCandidate(row);
+        if (await hasDeferredNativeWakeStop(tx, row, issueId)) {
+          excludedWakeIds = [...(excludedWakeIds ?? []), row.id];
+          continue;
+        }
         try {
           const authorizedFailedChatRetry = await authorizeFailedChatRunRetryWake(
             db,
