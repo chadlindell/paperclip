@@ -1145,6 +1145,9 @@ async function consumeTurn(
     let highestContiguousSourceSeq = 0;
     let governedResult: PrpStructuredRunResult | null = null;
     let semanticResultProposal: PrpStructuredRunResult | null = null;
+    let semanticResultTurnId: string | null = null;
+    let observedTurnStart = false;
+    let latestStartedTurnId: string | null = null;
     let sessionGoalObserved = sessionGoal !== undefined;
     let previousGoal = initialGoal ?? null;
     let goalControlObserved = false;
@@ -1284,6 +1287,29 @@ async function consumeTurn(
         highestContiguousSourceSeq,
         receipt.highestContiguousSourceSeq,
       );
+      // NativeSession events carry the normalized provider turn identity.
+      // A new turn revokes the preceding turn's completion authority, just as
+      // the provider driver does. Preserve duplicate/replayed starts only when
+      // both events prove the same turn; an absent identity cannot prove reuse.
+      if (event.eventType === "turn.started") {
+        observedTurnStart = true;
+        latestStartedTurnId = event.turnId ?? null;
+      }
+      if (event.eventType === "turn.started" && semanticResultProposal !== null &&
+          (!event.turnId || event.turnId !== semanticResultTurnId)) {
+        semanticResultProposal = null;
+        semanticResultTurnId = null;
+        if (resultSource === "semantic_result") {
+          governedResult = null;
+          resultSource = null;
+        }
+      }
+      // A delayed result from a preceding turn cannot reacquire authority after
+      // the new turn has started. Keep its durable event for diagnosis, but do
+      // not replace either a current report or the missing-report outcome.
+      // Before observing a start, replayed reports retain their existing path.
+      if (event.eventType === "run.result.proposed" && observedTurnStart &&
+          (!latestStartedTurnId || event.turnId !== latestStartedTurnId)) continue;
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
@@ -1310,7 +1336,10 @@ async function consumeTurn(
       }
       if (event.eventType === "run.result.proposed") {
         const validation = validatePrpStructuredRunResult(event.payload);
-        if (validation.ok) semanticResultProposal = validation.result;
+        if (validation.ok) {
+          semanticResultProposal = validation.result;
+          semanticResultTurnId = event.turnId ?? null;
+        }
       }
       if (event.eventType === "session.failed") {
         const failure = payload.error && typeof payload.error === "object"
@@ -1452,7 +1481,7 @@ async function consumeTurn(
             highestContiguousSourceSeq,
             governedResult:
               governedResult ??
-              (goalStatus(eventGoal) === "complete" ? semanticResultProposal : null) ??
+              semanticResultProposal ??
               sessionGoalResult(
                 input,
                 eventGoal,
@@ -1471,7 +1500,7 @@ async function consumeTurn(
               highestContiguousSourceSeq,
               governedResult:
                 governedResult ??
-                (goalStatus(latestSessionGoal) === "complete" ? semanticResultProposal : null) ??
+                semanticResultProposal ??
                 sessionGoalResult(
                   input,
                   latestSessionGoal,
@@ -1788,36 +1817,34 @@ function sessionGoalResult(
   reason: string,
 ): PrpStructuredRunResult {
   const status = goalStatus(goal);
+  if (status === "complete") {
+    // Callers prefer an accepted semantic report. A later provider-goal update
+    // is lifecycle state, not evidence that this task's contract was fulfilled.
+    throw new NativeProviderTerminalFailure("semantic_completion_missing", false,
+      "The provider goal completed without an accepted completion report.");
+  }
   const objective = goal?.objective ?? input.completionContract.contract.objective;
-  const disposition = status === "complete"
-    ? "done"
-    : status === "blocked"
+  const disposition = status === "blocked"
       ? "blocked"
       : "yielded";
   const result: PrpStructuredRunResult = {
     schema: "paperclip.run_result.v1",
     reportedWorkDisposition: disposition,
-    summary: status === "complete"
-      ? `Session goal completed: ${objective}`
-      : status === "blocked"
+    summary: status === "blocked"
         ? `Session goal blocked: ${objective}`
         : `Session goal yielded (${status ?? "cleared"}): ${objective}`,
     completionClaim: {
       contractRevision: input.completionContract.contract.revision,
-      objectiveSatisfied: status === "complete",
+      objectiveSatisfied: false,
       criteria: input.completionContract.contract.criteria.map((criterion) => ({
         criterionId: criterion.id,
-        status: status === "complete" ? "satisfied" : "unknown",
-        evidenceRefs: status === "complete" ? ["session-goal:complete"] : [],
+        status: "unknown",
+        evidenceRefs: [],
         explanation: `Provider session goal status: ${status ?? "cleared"}.`,
       })),
-      remainingWork: status === "complete"
-        ? []
-        : [{ description: reason, blocksCompletion: true }],
+      remainingWork: [{ description: reason, blocksCompletion: true }],
     },
-    evidence: status === "complete"
-      ? [{ kind: "session_goal_status", ref: "session-goal:complete" }]
-      : [],
+    evidence: [],
     verification: [],
     attentionRequests: [],
     artifacts: [],

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -176,6 +176,14 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       },
       environmentLeaseId: "lease-native-codex-e2e",
     });
+    const reportPath = resolve(runtimeRoot, "explicit-completion-report.json");
+    const writeReport = async (contract: { revision: string; criterionIds: string[] }) => writeFile(reportPath, JSON.stringify({
+      schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Codex completed the fake turn.",
+      completionClaim: { contractRevision: contract.revision, objectiveSatisfied: true,
+        criteria: contract.criterionIds.map(criterionId => ({ criterionId, status: "satisfied", evidenceRefs: ["fixture:checked-task"] })), remainingWork: [] },
+      evidence: [{ ref: "fixture:checked-task" }], verification: [], attentionRequests: [], artifacts: [],
+    }));
+    await writeReport(native.completionContract);
     const logs: string[] = [];
     const execute = executeNativeCodexRunner({
       db,
@@ -204,6 +212,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
           resolve(runtimeRoot, "fake-codex-state.json"),
           "--call-log",
           resolve(runtimeRoot, "fake-codex-calls.log"),
+          "--terminal-result-file", reportPath,
           "--require-dynamic-tool",
           "--emit-tool-call",
           "--expected-canonical-task-context",
@@ -301,6 +310,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       },
       environmentLeaseId: "lease-native-codex-resume",
     });
+    await writeReport(resumedNative.completionContract);
     const resumed = await executeNativeCodexRunner({
       db,
       companyId,
@@ -328,6 +338,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
           resolve(runtimeRoot, "fake-codex-state.json"),
           "--call-log",
           resolve(runtimeRoot, "fake-codex-calls.log"),
+          "--terminal-result-file", reportPath,
         ],
         providerVersion: "fake-codex-v1",
       },
