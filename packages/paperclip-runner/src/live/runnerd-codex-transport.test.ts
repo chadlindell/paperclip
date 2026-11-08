@@ -1253,10 +1253,12 @@ it.each([false, true])("uses the same API result envelope and fences handler pub
   }
 }, 20_000);
 
-it.each(["after_budget", "within_budget", "interrupted_within_budget", "persistence_failure"] as const)(
+it.each(["after_budget", "within_budget", "interrupted_within_budget", "persistence_failure", "stop_failure", "drain_failure"] as const)(
   "fences reusable suspension against late semantic completion (%s)",
   async (mode) => {
     const settles = mode === "within_budget" || mode === "interrupted_within_budget";
+    const retirementFails = mode === "stop_failure" || mode === "drain_failure";
+    let restoreRetirement = () => {};
     const stateDirectory = await mkdtemp(
       join(tmpdir(), "runnerd-late-semantic-close-"),
     );
@@ -1342,11 +1344,13 @@ it.each(["after_budget", "within_budget", "interrupted_within_budget", "persiste
         await bundle.transport.request("turn/interrupt", { reason: "test-stop-during-server-write" });
         expect(core.semanticToolResultsSettled()).toBe(false);
       }
+      if (mode === "stop_failure") { const spy = vi.spyOn(core, "stop").mockRejectedValue(new Error("injected normal stop failure")); restoreRetirement = () => spy.mockRestore(); }
+      if (mode === "drain_failure") { const spy = vi.spyOn(core, "drainPendingConnectionProcessing").mockRejectedValue(new Error("injected normal drain failure")); restoreRetirement = () => spy.mockRestore(); }
       const closing = bundle.transport.close().then(
         () => null,
         (error: unknown) => error,
       );
-      if (mode !== "after_budget") {
+      if (mode !== "after_budget" && !retirementFails) {
         // close() synchronously marks the transport closed before its first
         // await; only now may the already-entered handler finish.
         release();
@@ -1366,8 +1370,17 @@ it.each(["after_budget", "within_budget", "interrupted_within_budget", "persiste
         expect(reopened.semanticToolResultsSettled()).toBe(false);
         await reopened.stop();
       }
+      const retiredJournal = mode === "after_budget" || retirementFails
+        ? await readFile(join(stateDirectory, "control-plane", "control-plane-state.json"), "utf8")
+        : null;
       release();
-      if (mode === "persistence_failure") {
+      if (mode === "after_budget" || retirementFails) {
+        // Semantic writes are fenced even if retirement failed. Preserve the
+        // unresolved input for reconciliation without a late journal mutation.
+        await new Promise(resolveWait => setTimeout(resolveWait, 50));
+        expect(await readFile(join(stateDirectory, "control-plane", "control-plane-state.json"), "utf8")).toBe(retiredJournal);
+      }
+      if (mode === "persistence_failure" || mode === "after_budget" || retirementFails) {
         expect(core.semanticToolResultsSettled()).toBe(false);
         expect(
           core.store.state.commands.filter(
@@ -1407,6 +1420,10 @@ it.each(["after_budget", "within_budget", "interrupted_within_budget", "persiste
         expect(closeFailure).toBeNull();
         expect(core.semanticToolResultsSettled()).toBe(true);
         expect(checkpoint).toHaveBeenCalledWith("settled");
+      } else if (retirementFails) {
+        expect(closeFailure).toBeInstanceOf(Error);
+        expect((closeFailure as Error).message).toContain("injected normal");
+        expect(checkpoint).not.toHaveBeenCalled();
       } else {
         expect(closeFailure).toBeInstanceOf(
           NativeSessionCloseUnrecoverableError,
@@ -1422,6 +1439,8 @@ it.each(["after_budget", "within_budget", "interrupted_within_budget", "persiste
     } finally {
       release();
       await bundle.transport.close().catch(() => undefined);
+      restoreRetirement();
+      await core?.stop().catch(() => undefined);
       await rm(stateDirectory, { recursive: true, force: true });
     }
   },

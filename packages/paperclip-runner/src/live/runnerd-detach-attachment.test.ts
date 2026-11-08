@@ -1,0 +1,183 @@
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { expect, it } from "vitest";
+import type { DurablePrpControlPlane, RunnerProcessHandle, RunnerProcessResult } from "../control-plane/durable-prp-control-plane.js";
+import { createCapabilityRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "./runnerd-codex-transport.js";
+
+function gate() {
+  let release!: () => void;
+  const promise = new Promise<void>(done => { release = done; });
+  return { promise, release };
+}
+
+it.each([
+  { mode: "registration", releaseFailure: "none", retirement: "detach" },
+  { mode: "activation", releaseFailure: "none", retirement: "detach" },
+  { mode: "activation", releaseFailure: "target", retirement: "detach" },
+  { mode: "activation", releaseFailure: "prior", retirement: "detach" },
+  { mode: "registration", releaseFailure: "target", retirement: "close" },
+  { mode: "prior-release", releaseFailure: "none", retirement: "detach" },
+] as const)(
+  "joins an admitted warm attachment and preserves release failures ($mode, $releaseFailure, $retirement)",
+  async ({ mode, releaseFailure, retirement }) => {
+    const root = await mkdtemp(join(tmpdir(), "runnerd-detach-attachment-"));
+    const entered = gate();
+    const held = gate();
+    const releaseEntered = gate();
+    const releaseHeld = gate();
+    const handles: RunnerProcessHandle[] = [];
+    const routes: string[] = [];
+    const releaseReasons: Array<{ route: string; reason: string | undefined }> = [];
+    let core!: DurablePrpControlPlane;
+    let initialized = false;
+    let attaching: Promise<void> | undefined;
+    let detaching: Promise<void> | undefined;
+    let detached = false;
+    let detachSettled = false;
+    const providerLog = join(root, "provider-calls.log");
+    const bundle = createCapabilityRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: resolve(import.meta.dirname, "../../runner/target/debug/fake-codex-app-server"),
+      codexArgs: ["--state-file", join(root, "provider.json"), "--call-log", providerLog],
+      sourceCodexHome: "",
+      stateDirectory: root,
+      closeGraceMs: mode === "prior-release" ? 100 : 5_000,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+      controlPlaneRegistration: async (authority, identity) => {
+        core = authority;
+        if (!initialized) {
+          initialized = true;
+          await authority.start();
+          return { release: (reason) => {
+            releaseReasons.push({ route: "prior", reason });
+            if (mode === "prior-release") {
+              entered.release();
+              return held.promise.then(() => { routes.push("prior:released"); });
+            }
+            routes.push("prior:released");
+            if (releaseFailure === "prior") throw new Error("synthetic prior route release failed");
+          } };
+        }
+        expect(identity?.runId).toBe("attachment-next-run");
+        routes.push("next:registration-started");
+        if (mode === "registration") {
+          entered.release();
+          await held.promise;
+        }
+        routes.push("next:registered");
+        return {
+          activate: async () => {
+            routes.push("next:activation-started");
+            if (mode === "activation") {
+              entered.release();
+              await held.promise;
+            }
+            routes.push("next:activated");
+          },
+          release: async (reason) => {
+            releaseReasons.push({ route: "next", reason });
+            routes.push("next:release-started");
+            releaseEntered.release();
+            await releaseHeld.promise;
+            routes.push("next:released");
+            if (releaseFailure === "target") throw new Error("synthetic target route release failed");
+          },
+        };
+      },
+      runnerProcessLauncher: spec => {
+        const child = spawn(spec.command, [...spec.args], {
+          cwd: spec.cwd, env: spec.environment, stdio: "ignore",
+        });
+        const completion = new Promise<RunnerProcessResult>((done, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code, signal) => done({ code, signal, stdout: "", stderr: "" }));
+        });
+        const handle = { child, completion };
+        handles.push(handle);
+        return handle;
+      },
+    });
+    const journal = () => readFile(join(root, "control-plane", "control-plane-state.json"), "utf8");
+    try {
+      await bundle.transport.request("thread/start", { cwd: root });
+      const initialIdentity = structuredClone(core.store.state.identity);
+      const providerPid = bundle.evidence().codexPid;
+      expect(providerPid).toBeGreaterThan(0);
+      attaching = bundle.transport.attachRun!({
+        runId: "attachment-next-run", turnId: "attachment-next-turn", itemId: "attachment-next-item",
+      });
+      void attaching.catch(() => undefined);
+      await entered.promise;
+      if (mode === "activation") {
+        expect(core.store.state.commands.some(command => command.type === "run.attach" && command.status === "completed")).toBe(true);
+      }
+      detaching = (retirement === "detach" ? bundle.detachControllerForRestart() : bundle.transport.close())
+        .then(() => { detached = true; })
+        .finally(() => { detachSettled = true; });
+      void detaching.catch(() => undefined);
+      if (mode === "prior-release") {
+        await expect(detaching).rejects.toThrow("startup drain timed out");
+        expect(detached).toBe(false);
+        held.release();
+        releaseHeld.release();
+        await expect(attaching).rejects.toThrow(/closed/);
+        expect(routes.filter(value => value === "next:released")).toHaveLength(1);
+        expect(releaseReasons.filter(value => value.route === "next")).toEqual([{ route: "next", reason: "detach" }]);
+        await expect(bundle.detachControllerForRestart()).rejects.toThrow("startup drain timed out");
+        expect(handles).toHaveLength(1);
+        return;
+      }
+      await new Promise(done => setTimeout(done, 100));
+      expect(detachSettled, "detach must join the originally admitted attachment callback").toBe(false);
+      held.release();
+      await releaseEntered.promise;
+      await new Promise(done => setTimeout(done, 100));
+      expect(detachSettled, "detach must also join that attachment's asynchronous route release").toBe(false);
+      releaseHeld.release();
+      await expect(attaching).rejects.toThrow(/closed/);
+      expect(releaseReasons.filter(value => value.route === "next")).toEqual([
+        { route: "next", reason: retirement === "detach" ? "detach" : undefined },
+      ]);
+      if (releaseFailure !== "none") {
+        await expect(detaching).rejects.toThrow(`synthetic ${releaseFailure} route release failed`);
+        expect(detached, "failed route cleanup must never authorize a successor").toBe(false);
+        expect(handles).toHaveLength(1);
+        return;
+      }
+      await detaching;
+      expect(detached).toBe(true);
+      expect(routes.filter(value => value === "next:released")).toHaveLength(1);
+      if (mode === "registration") {
+        expect(core.store.state.identity).toEqual(initialIdentity);
+        expect(routes).not.toContain("next:activation-started");
+        expect(core.store.state.commands.some(command => command.type === "run.attach")).toBe(false);
+      }
+      const retiredJournal = await journal();
+      const retiredRoutes = [...routes];
+      const retiredIdentity = structuredClone(core.store.state.identity);
+      const providerCalls = await readFile(providerLog, "utf8");
+      expect(providerCalls.split("\n").filter(line => line === "initialize")).toHaveLength(1);
+      expect(handles).toHaveLength(1);
+      expect(bundle.evidence().codexPid).toBe(providerPid);
+      await new Promise(done => setTimeout(done, 150));
+      expect(await journal()).toBe(retiredJournal);
+      expect(routes).toEqual(retiredRoutes);
+      expect(core.store.state.identity).toEqual(retiredIdentity);
+      expect(await readFile(providerLog, "utf8")).toBe(providerCalls);
+      expect(handles).toHaveLength(1);
+    } finally {
+      held.release();
+      releaseHeld.release();
+      await attaching?.catch(() => undefined);
+      await detaching?.catch(() => undefined);
+      await bundle.transport.close().catch(() => undefined);
+      for (const handle of handles) {
+        if (handle.child.exitCode === null && handle.child.signalCode === null) handle.child.kill("SIGKILL");
+        await handle.completion.catch(() => undefined);
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000,
+);

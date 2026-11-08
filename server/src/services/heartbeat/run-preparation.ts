@@ -1,4 +1,5 @@
 import { skillPackageStore, skillVersionMetadataColumns } from "../skill-package-store.js";
+import { INTERACTION_CONTINUATION_CONTEXT_KEYS } from "./ownership-wait-predicate.js";
 import { skillAccessService } from "../skill-access.js";
 import { buildReviewPathRecoveryDisposition } from "../recovery/review-path-recovery.js";
 import type { AuthorizationActor } from "../authorization.js";
@@ -799,6 +800,8 @@ export interface WakeupOptions {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an existing undelivered user comment. */
   queuedCommentRequestId?: string;
+  executionWaitResumeId?: string;
+  executionWaitResumePayload?: Record<string, unknown>;
   /** Internal delivery of the authenticated task-level Retry receipt. */
   taskRetryRequestId?: string;
   /** Exact failed run selected by an authenticated board Retry request. */
@@ -1732,15 +1735,7 @@ export function enrichWakeContextSnapshot(input: {
   };
 }
 
-const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
-  "interactionId",
-  "interactionKind",
-  "interactionStatus",
-  "continuationPolicy",
-  "checkboxSelection",
-  "itemVerdicts",
-  "newlyResolvedItemIds",
-] as const;
+export { INTERACTION_CONTINUATION_CONTEXT_KEYS } from "./ownership-wait-predicate.js";
 
 export function isInteractionResolutionWakePayload(
   payload: Record<string, unknown> | null | undefined,

@@ -377,7 +377,11 @@ class RunnerdExternalSession implements HarnessSession {
       lastSourceSequence: this.#events.at(-1)?.sourceSeq ?? 0 };
   }
   async detachControllerForRestart() {
-    this.#closed = true; this.#wake();
+    this.#closed = true;
+    // Revoke callback authority before any fallible cleanup. A failed detach
+    // must preserve pending input for recovery without allowing late receipts.
+    this.#core?.fenceSemanticToolCallbacks();
+    this.#wake();
     await this.#detachPort?.(); await this.#release?.(); await this.#core?.stop();
     await this.#core?.drainPendingConnectionProcessing();
     this.#core?.retireSemanticToolCallbacks();

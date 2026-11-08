@@ -6,6 +6,8 @@ import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import type { DeferredExecutionScope, DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { issueBlockersResolvedWakePayloadSql } from "../issue-dependency-wakeups.js";
+import { hasNativeStatusWakeIntent, isDeferredExecutionOwnershipWait } from "./queue.js";
+import { hasDeferredNativeWakeStop } from "../native-runtime/native-continuation-delivery.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean };
 type NativeIntentOptions = DeferredExecutionScope & {
@@ -95,6 +97,8 @@ export function registerDeferredReceiptWork(
       },
       check: async entry => {
         if (!enabled) return null;
+        let ownershipWait = false;
+        let nativeStatusWait = false;
         if (kind !== "task_chat") {
           const [current] = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload,
             updatedAt: agentWakeupRequests.updatedAt, claimedAt: agentWakeupRequests.claimedAt, error: agentWakeupRequests.error,
@@ -105,6 +109,8 @@ export function registerDeferredReceiptWork(
           }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
             eq(agentWakeupRequests.id, entry.id)));
           if (!current) return null;
+          ownershipWait = kind === "deferred" && isDeferredExecutionOwnershipWait(current.payload);
+          nativeStatusWait = kind === "deferred" && hasNativeStatusWakeIntent(current.payload);
           const due = kind === "native" && current.status === "claimed" && current.claimedAt
             ? current.claimedAt.getTime() + 60_000
             : kind === "native" && current.status === "queued" && current.error ? current.updatedAt.getTime() + 30_000
@@ -125,6 +131,21 @@ export function registerDeferredReceiptWork(
           const failed = (error: unknown) => { if (!(error instanceof PersistedExecutionWaitRefusal)) errors.push(error); };
           try { await owner.resume({ ...scope, onError: failed }); }
           catch (error) { failed(error); }
+          if (ownershipWait || nativeStatusWait) {
+            const [remaining] = await db.select({ status: agentWakeupRequests.status,
+              payload: agentWakeupRequests.payload, updatedAt: agentWakeupRequests.updatedAt,
+              companyId: agentWakeupRequests.companyId, agentId: agentWakeupRequests.agentId,
+              requestedAt: agentWakeupRequests.requestedAt, requestedByActorType: agentWakeupRequests.requestedByActorType,
+              requestedByActorId: agentWakeupRequests.requestedByActorId })
+              .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
+                eq(agentWakeupRequests.id, entry.id)));
+            if (remaining?.status === "deferred_issue_execution" &&
+                (isDeferredExecutionOwnershipWait(remaining.payload) || hasNativeStatusWakeIntent(remaining.payload))) {
+              const issueId = remaining.payload?.issueId;
+              const stopped = nativeStatusWait && typeof issueId === "string" && await hasDeferredNativeWakeStop(db, remaining, issueId);
+              if (!stopped) next = Math.max(Date.now() + 30_000, remaining.updatedAt.getTime() + 30_000);
+            }
+          }
         }
         if (errors.length) throw new AggregateError(errors, `Deferred receipt ${entry.id} could not settle`);
         return next === null ? null : { ...entry, dueAt: next, immediate: false };

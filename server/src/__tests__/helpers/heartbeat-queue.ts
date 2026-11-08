@@ -67,6 +67,7 @@ export function createHeartbeatQueueTestDependencies(db: Db): QueueTestDependenc
     cancelRunInternal: vi.fn<HeartbeatQueueDependencies["cancelRunInternal"]>(async () => undefined),
     cancelActiveForAgentInternal: vi.fn<HeartbeatQueueDependencies["cancelActiveForAgentInternal"]>(async () => undefined),
     resumeExecutionWaitComments: vi.fn<HeartbeatQueueDependencies["resumeExecutionWaitComments"]>(async () => undefined),
+    resumeExecutionOwnershipWaits: vi.fn<HeartbeatQueueDependencies["resumeExecutionOwnershipWaits"]>(async () => undefined),
     resumeQueuedCommentInterrupt: vi.fn<HeartbeatQueueDependencies["resumeQueuedCommentInterrupt"]>(async () => undefined),
     resumeSavedLegacyComments: vi.fn<HeartbeatQueueDependencies["resumeSavedLegacyComments"]>(async () => undefined),
     formatIssueIdentifierLink: (_identifier: string | null, fallback: string) => fallback,

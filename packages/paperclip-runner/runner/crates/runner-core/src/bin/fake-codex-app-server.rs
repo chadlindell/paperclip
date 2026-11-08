@@ -312,6 +312,31 @@ fn finish_turn(state_path: &Path, state: &mut FakeState, status: &str) -> io::Re
     finish_turn_with_send(state_path, state, status, send)
 }
 
+fn emit_fixture_goal(state_path: &Path, state: &mut FakeState, status: &str) -> io::Result<()> {
+    let goal = json!({"objective": "Verify explicit completion authority", "status": status,
+        "tokenBudget": null, "tokensUsed": 1, "timeUsedSeconds": 1,
+        "createdAt": "2026-08-28T00:00:00.000Z", "updatedAt": "2026-08-28T00:00:01.000Z"});
+    if status == "complete" {
+        // Keep serving goal/get while the consumer commits the turn terminal;
+        // publishing completion earlier would exercise the opposite ordering.
+        let gate = state_path.with_file_name("late-goal-turn-observed");
+        let thread_id = state.thread_id.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !gate.is_file() && Instant::now() < deadline { thread::sleep(Duration::from_millis(1)); }
+            if gate.is_file() {
+                let _ = send(json!({"method": "thread/goal/updated", "params": {
+                    "threadId": thread_id, "goal": goal, "workingNow": false}}));
+            }
+        });
+        return Ok(());
+    }
+    state.goal = Some(goal);
+    save_state(state_path, state)?;
+    send(json!({"method": "thread/goal/updated", "params": {
+        "threadId": state.thread_id, "goal": state.goal, "workingNow": true}}))
+}
+
 fn finish_turn_with_send(
     state_path: &Path,
     state: &mut FakeState,
@@ -1129,6 +1154,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "failed"
                 },
             )?;
+            if args.iter().any(|arg| arg == "--late-complete-goal") {
+                emit_fixture_goal(&state_path, &mut state, "complete")?;
+            }
             continue;
         }
         if message.get("method").is_none() && message.get("id") == Some(&json!("tool-request-1")) {
@@ -1190,7 +1218,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }))?;
             } else if !hold_turn {
-                finish_turn(&state_path, &mut state, "completed")?;
+                if let Some(result) = &terminal_result {
+                    send(json!({ "id": "terminal-result-request", "method": "item/tool/call",
+                        "params": { "threadId": state.thread_id, "turnId": state.active_turn_id,
+                            "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result } }))?;
+                } else {
+                    finish_turn(&state_path, &mut state, "completed")?;
+                }
             }
             continue;
         }
@@ -1419,6 +1453,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "arguments": {}
                             }
                         }))?;
+                    }
+                }
+                if args.iter().any(|arg| arg == "--replay-terminal-result-on-resume") {
+                    if let (Some(turn_id), Some(result)) = (state.active_turn_id.as_deref(), terminal_result.as_ref()) {
+                        if !(hold_first_durable_turn && state.next_turn == 1) {
+                            send(json!({"id": "terminal-result-request", "method": "item/tool/call",
+                                "params": {"threadId": state.thread_id, "turnId": turn_id,
+                                    "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result}}))?;
+                        }
                     }
                 }
             }
@@ -1833,6 +1876,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "method": "turn/started",
                     "params": {"turn": {"id": provider_turn_id}}
                 }))?;
+                if args.iter().any(|arg| arg == "--late-complete-goal") {
+                    emit_fixture_goal(&state_path, &mut state, "active")?;
+                }
                 if args.iter().any(|value| value == "--account-notifications") {
                     send(json!({"method":"account/updated", "params":{
                         "authMode":"chatgpt", "planType":"pro"
@@ -2033,7 +2079,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "version":1,"supersedeOnUserComment":false}
                         }}),
                     )?;
-                } else if let Some(result) = &terminal_result {
+                } else if let Some(result) = terminal_result.as_ref().filter(|_| !emit_tool_call && !hold_turn) {
                     send(json!({
                         "id": "terminal-result-request", "method": "item/tool/call",
                         "params": { "threadId": state.thread_id, "turnId": provider_turn_id,
@@ -2093,6 +2139,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     send_question(&state)?;
                 } else if !hold_turn {
                     finish_turn(&state_path, &mut state, "completed")?;
+                    if args.iter().any(|arg| arg == "--late-complete-goal") {
+                        emit_fixture_goal(&state_path, &mut state, "complete")?;
+                    }
                     if delayed_tool_after_second_turn_completion && turn_start_count == 2 {
                         send(json!({
                             "id": "tool-request-idle-two-turns-delayed",

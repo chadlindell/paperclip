@@ -2020,7 +2020,7 @@ export class DurablePrpControlPlane {
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
   #connectionLeaseFailure: DurablePrpConnectionLeaseFailure | null = null;
   #pendingSemanticCalls = new Set<string>();
-  #semanticCallbacksRetired = false;
+  #semanticCallbacksFenced = false;
   #semanticResultPersistenceFailed = false;
   #semanticResultFailures: Array<{
     callId: string;
@@ -2262,10 +2262,10 @@ export class DurablePrpControlPlane {
   }
 
   async recoverPendingSemanticInputs(): Promise<void> {
-    if (this.#retainsSourceInputs() || !this.#recoverSemanticToolInput) return;
+    if (this.#retainsSourceInputs() || this.#semanticCallbacksFenced || !this.#recoverSemanticToolInput) return;
     const identity = this.#identity;
     for (const saved of [...this.#store.state.committedEvents]) {
-      if (this.#retainsSourceInputs() || this.#identity !== identity || this.#semanticCallbacksRetired) return;
+      if (this.#retainsSourceInputs() || this.#identity !== identity || this.#semanticCallbacksFenced) return;
       if (!unsettledSemanticInput(saved, this.#store.state)) continue;
       const event = saved.envelope.payload as PrpEvent;
       const semantic = (event.payload as Record<string, unknown>).semantic_tool as Record<string, unknown>;
@@ -2280,7 +2280,7 @@ export class DurablePrpControlPlane {
           correlation: { runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
             turnId: identity.turnId, itemId: event.itemId ?? identity.itemId } };
         const outcome = await this.#recoverSemanticToolInput(call);
-        if (this.#identity !== identity || this.#semanticCallbacksRetired || this.#retainsSourceInputs()) return;
+        if (this.#identity !== identity || this.#semanticCallbacksFenced || this.#retainsSourceInputs()) return;
         if (!outcome || this.#getCommand(commandId)) continue;
         const { input, ...metadata } = call;
         this.queueCommand("semantic_tool.result", { ...metadata, inputDigest: canonicalDigest(input),
@@ -2350,10 +2350,24 @@ export class DurablePrpControlPlane {
         throw new Error("Connection processing drain requires stopped ingress.");
     };
     assertIngressStopped();
-    while (this.#connectionProcessing.size > 0) {
+    for (;;) {
       await Promise.allSettled([...this.#connectionProcessing.values()]);
       assertIngressStopped();
+      // Command/result publication can enqueue a checkpoint independently of
+      // wire processing. Join that original write before proving takeover safe;
+      // failed persistence keeps retirement unproven rather than being hidden.
+      const persistence = this.#persistenceTail;
+      await persistence;
+      assertIngressStopped();
+      if (this.#connectionProcessing.size === 0 && persistence === this.#persistenceTail) return;
     }
+  }
+
+  /** Revoke semantic dispatch, recovery and result publication synchronously.
+   * This one-way fence does not prove ingress or pending persistence drained;
+   * retirement still requires the owning transport's bounded drain to succeed. */
+  fenceSemanticToolCallbacks(): void {
+    this.#semanticCallbacksFenced = true;
   }
 
   /** Retire this journal writer after stopped ingress is fully joined. A late
@@ -2363,7 +2377,7 @@ export class DurablePrpControlPlane {
     if (this.#server !== null || this.#connections.size !== 0 || this.#connectionProcessing.size !== 0) {
       throw new Error("Semantic callback retirement requires drained, stopped ingress.");
     }
-    this.#semanticCallbacksRetired = true;
+    this.fenceSemanticToolCallbacks();
   }
 
   /** Forces a resumable re-authentication after an immutable run attachment rotates. */
@@ -4326,7 +4340,7 @@ export class DurablePrpControlPlane {
       : null;
     const liveCommandId = liveCall ? `command_tool_${createHash("sha256")
       .update(`${identity.runId}\0${liveCall.callId}`).digest("hex").slice(0, 32)}` : null;
-    const ownsLiveDispatch = existing === undefined && liveCommandId !== null
+    const ownsLiveDispatch = !this.#semanticCallbacksFenced && existing === undefined && liveCommandId !== null
       && !this.#getCommand(liveCommandId) && !this.#pendingSemanticCalls.has(liveCommandId);
     // Reserve the original callback before exposing its checkpoint wait to
     // recovery. A missing saved outcome must never suppress first dispatch.
@@ -4335,10 +4349,11 @@ export class DurablePrpControlPlane {
     try {
       await this.flushCheckpoint();
       if (this.#eventOwner !== connection || this.#identity !== identity) return;
-      if (!this.#retainsSourceInputs() && ownsLiveDispatch && liveCall && liveCommandId && this.#onSemanticToolInput && !this.#getCommand(liveCommandId)) {
+      if (!this.#retainsSourceInputs() && !this.#semanticCallbacksFenced && ownsLiveDispatch && liveCall && liveCommandId && this.#onSemanticToolInput && !this.#getCommand(liveCommandId)) {
         const call = liveCall;
         const commandId = liveCommandId;
         const recordFailure = (stage: "persist_result" | "dispatch", error: unknown) => {
+          if (this.#semanticCallbacksFenced) return;
           this.#semanticResultPersistenceFailed = true;
           // Keep diagnostics bounded and content-free. Exception messages can
           // contain tool bodies or credentials; retain only known error codes.
@@ -4351,7 +4366,7 @@ export class DurablePrpControlPlane {
           this.disconnectActiveRunner();
         };
         const queueResult = (result: unknown, isError: boolean): void => {
-          if (this.#semanticCallbacksRetired) return;
+          if (this.#semanticCallbacksFenced) return;
           try {
             // Retain the full input once in its canonical event. Copying a
             // large write into its result command can exceed the wire bound
