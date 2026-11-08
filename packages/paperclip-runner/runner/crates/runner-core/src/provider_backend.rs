@@ -890,9 +890,13 @@ fn terminal_events(
     // A provider turn ending (or its native goal becoming complete) is not
     // a completion report for Paperclip's bound task contract. Only an accepted
     // semantic result can claim that the objective and criteria were satisfied.
+    // Cursor Cloud keeps upstream's unreported-turn path: a needs_review result
+    // with an unsatisfied claim, never a completed task.
     let missing_completion = state.active_provider_result_fingerprint.is_none()
         && (goal_status == Some("complete")
-            || (goal_status.is_none() && event_type == "turn.completed"));
+            || (goal_status.is_none()
+                && event_type == "turn.completed"
+                && state.config.provider != "cursor_cloud"));
     if rejected_completion || empty_opencode_completion || missing_completion {
         return vec![
             NormalizedProviderEvent {
