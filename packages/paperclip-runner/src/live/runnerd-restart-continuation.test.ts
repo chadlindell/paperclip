@@ -153,10 +153,19 @@ it("starts a new turn when the restored runner reports a lost turn the checkpoin
     } },
     interactionResponses: [], credentialBindings: [],
   };
+  // The recovered turn reports its own result; turn completion alone does not
+  // satisfy the task contract.
+  const reportPath = join(root, "completion-report.json");
+  await writeFile(reportPath, JSON.stringify({
+    schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Checked the recovered synthetic work.",
+    completionClaim: { contractRevision: "1", objectiveSatisfied: true,
+      criteria: [{ criterionId: "checks", status: "satisfied", evidenceRefs: ["fixture:checks"] }], remainingWork: [] },
+    evidence: [{ ref: "fixture:checks" }], verification: [], attentionRequests: [], artifacts: [],
+  }));
   const options = {
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: resolve(import.meta.dirname, "../../runner/target/debug/fake-codex-app-server"),
-    codexArgs: ["--state-file", join(root, "fake-state.json"), "--call-log", join(root, "calls.log"), "--durable-turn-ids", "--hold-first-durable-turn"],
+    codexArgs: ["--state-file", join(root, "fake-state.json"), "--call-log", join(root, "calls.log"), "--durable-turn-ids", "--hold-first-durable-turn", "--terminal-result-file", reportPath],
     stateDirectory: root,
     turnStartTimeoutMs: 8_000,
     prpIdentity: { runnerInstanceId: "runner-unbound", environmentLeaseId: "lease-unbound", runId: identity.runId, normalizedSessionId: identity.sessionId, turnId: "turn-unbound", itemId: "item-unbound" },
